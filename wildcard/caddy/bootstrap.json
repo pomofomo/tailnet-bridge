@@ -1,0 +1,15 @@
+{
+  "admin": {
+    "listen": "127.0.0.1:2019",
+    "enforce_origin": false,
+    "origins": ["127.0.0.1:2019", "localhost:2019"]
+  },
+  "logging": {
+    "logs": {
+      "default": {
+        "level": "INFO"
+      }
+    }
+  },
+  "apps": {}
+}

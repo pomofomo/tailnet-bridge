@@ -1,0 +1,61 @@
+# Tailnet Community Bridge (wildcard-domain) — example configuration.
+# Copy to config.yml and edit. See SPEC.md §7 for the full schema.
+
+personal:
+  # Reference to the personal tailnet auth key. One of: auth_key_env,
+  # auth_key_file, auth_key (direct, discouraged).
+  auth_key_env: PERSONAL_TAILNET_AUTHKEY
+
+  # Optional. Hostname used by the bridge's community-side dialer nodes
+  # (visible to community admins as "<this>-bridge" or similar; see
+  # SPEC §9.1). If omitted, the container hostname is used.
+  bridge_hostname: alice-bridge
+
+# Communities this user belongs to. Zero or more entries.
+communities:
+  - id: smithfamily                  # local identifier; must be unique
+    # DNS subdomain owned by the community. Same name on both sides of
+    # the bridge. MUST match community.domain in the directory response
+    # (SPEC §8.2). MUST be exactly <community>.ts.<basedomain>.
+    domain: smithfamily.ts.example.com
+
+    # Directory URL on the community tailnet (HTTPS).
+    directory_url: https://directory.smithfamily.ts.example.com/services
+
+    # Env var holding the community-tailnet auth key.
+    auth_key_env: SMITHFAMILY_AUTHKEY
+
+    # Wildcard cert and key for *.<domain>, provisioned out-of-band by
+    # the community admin. The user places the files at these paths and
+    # overwrites them on each rotation (SPEC §6.3, §7.2). The bridge
+    # watches them and reloads Caddy when they change.
+    cert_path: /etc/bridge/certs/smithfamily/cert.pem
+    key_path:  /etc/bridge/certs/smithfamily/key.pem
+
+  # - id: austinmakers
+  #   domain: austinmakers.ts.example.com
+  #   directory_url: https://directory.austinmakers.ts.example.com/services
+  #   auth_key_env: AUSTINMAKERS_AUTHKEY
+  #   cert_path: /etc/bridge/certs/austinmakers/cert.pem
+  #   key_path:  /etc/bridge/certs/austinmakers/key.pem
+
+# How often to re-poll every community directory. Default 5m.
+poll_interval: 5m
+
+# How often to stat cert/key files for changes. Default 1m.
+cert_check_interval: 1m
+
+# How long to wait for a community tsnet node to come online before
+# considering it failed. Default 60s.
+community_join_timeout: 60s
+
+# State directory. tsnet node state persists here so the bridge keeps
+# the same node identity across restarts. Must be a writable volume.
+state_dir: /var/lib/bridge
+
+# Caddy admin endpoint. Default is fine inside the container.
+caddy_admin_addr: 127.0.0.1:2019
+
+# Local port for the orchestrator's error page + status server.
+# Caddy's handle_errors reverse-proxies to this port. Default 8081.
+orchestrator_error_port: 8081
