@@ -1,22 +1,35 @@
 # syntax=docker/dockerfile:1.7
 
+# Both stages need the same Go toolchain that orchestrator/go.mod and
+# caddy-plugin/bridgedns/go.mod require. Pinning the same image avoids
+# the silent skew the previous Dockerfile suffered from (caddy:2.8-builder
+# shipped an older Go than the orchestrator declared).
+
+ARG GO_IMAGE=golang:1.26-bookworm
+
 # ─── Stage 1: build Caddy with the Tailscale plugin + bridgedns ───────────
 # Note: replace-response is intentionally NOT included. The wildcard-domain
 # variant uses the same canonical hostname on both sides of the bridge, so
 # no body rewriting is ever needed (see SPEC §3.2, §5.1).
-FROM caddy:2.8-builder AS caddy-builder
+#
+# We use xcaddy directly under a standard golang image rather than the
+# caddy:builder image so the Go toolchain stays in lockstep with the
+# orchestrator stage and our module's `go` directive.
+FROM ${GO_IMAGE} AS caddy-builder
 WORKDIR /src
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 # Copy the local bridgedns plugin source into the builder so xcaddy can
 # reference it via --with <module>=<localpath>. The plugin shares the
 # same tsnet.Server caddy-tailscale creates, and binds UDP/53 for the
 # personal-tailnet Split DNS responder (SPEC §10.1).
 COPY caddy-plugin/bridgedns/ /src/bridgedns/
 RUN xcaddy build \
+    --output /out/caddy \
     --with github.com/tailscale/caddy-tailscale \
     --with github.com/tailnet-bridge/wildcard/caddy-plugin/bridgedns=/src/bridgedns
 
 # ─── Stage 2: build the orchestrator ──────────────────────────────────────
-FROM golang:1.23-bookworm AS orchestrator-builder
+FROM ${GO_IMAGE} AS orchestrator-builder
 WORKDIR /src
 COPY orchestrator/go.mod orchestrator/go.sum* ./
 RUN go mod download
@@ -29,7 +42,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=caddy-builder /usr/bin/caddy /usr/local/bin/caddy
+COPY --from=caddy-builder /out/caddy /usr/local/bin/caddy
 COPY --from=orchestrator-builder /out/orchestrator /usr/local/bin/orchestrator
 COPY caddy/bootstrap.json /etc/bridge/caddy-bootstrap.json
 

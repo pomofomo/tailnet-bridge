@@ -8,16 +8,29 @@
 // their public DNS so that ts.<base> records leak, the bridge keeps
 // working but the trust model is compromised — the user (and the admin)
 // need a clear signal, not silence.
+//
+// Logging dedupe: every probe fires `OnResult` (for the live status
+// snapshot), but `OnTransition` is only invoked when a domain crosses
+// the healthy ↔ violating boundary. Operators get one log line per
+// state change instead of two per domain per poll_interval (SPEC §12.4).
 package dnscheck
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 )
+
+// canaryPrefix is prepended to a random label per Checker instance to
+// probe a wildcard-style leak. Picking a unique name avoids colliding
+// with any service a community might legitimately operate (a literal
+// "any.<domain>" would).
+const canaryPrefix = "bridge-canary-"
 
 // Result is the outcome of one check round for one domain.
 type Result struct {
@@ -32,9 +45,9 @@ type Result struct {
 // Checker periodically queries `Domains` against `Resolver`.
 type Checker struct {
 	// Domains are the community subdomains to verify (e.g.
-	// "smithfamily.ts.example.com"). For each, we also probe the
-	// canonical synthetic "any" name "any.<domain>" since the
-	// wildcard-style violation could manifest only on subdomains.
+	// "smithfamily.ts.example.com"). For each, we also probe a
+	// per-process canary label "bridge-canary-<rand>.<domain>" so a
+	// wildcard public DNS misconfig surfaces too.
 	Domains []string
 
 	// Resolver is host:port of the public resolver to query
@@ -44,9 +57,24 @@ type Checker struct {
 	// Interval is how often to run a full pass. <=0 means single-shot.
 	Interval time.Duration
 
-	// OnResult is invoked for every check (violation or not). The
-	// status server uses this to keep an up-to-date snapshot.
+	// OnResult is invoked for every probe outcome. The status server
+	// uses this to keep an up-to-date snapshot.
 	OnResult func(Result)
+
+	// OnTransition is invoked the first time a domain crosses into
+	// (violating=true) or out of (violating=false) the leak state,
+	// regardless of the probe label. Designed for logging: one line
+	// per real change instead of N per tick.
+	OnTransition func(domain string, violating bool, answers []string, resolver string)
+
+	// canary is a per-Checker random subdomain probed alongside the
+	// apex; lazily generated on first Run / CheckOnce.
+	canaryMu sync.Mutex
+	canary   string
+
+	// transition state, per-domain. Lazily allocated.
+	stateMu sync.Mutex
+	state   map[string]bool // domain → currently-violating
 }
 
 // Run blocks until ctx is cancelled. It runs one immediate pass and then
@@ -84,29 +112,61 @@ func (c *Checker) CheckOnce(ctx context.Context, domain string) Result {
 }
 
 func (c *Checker) runOnce(ctx context.Context, r *net.Resolver) {
+	canary := c.canaryLabel()
 	var wg sync.WaitGroup
 	for _, d := range c.Domains {
 		wg.Add(2)
-		// Probe BOTH the domain itself and a synthetic subdomain — the
-		// wildcard cert covers *.<domain>, and a public-DNS leak might
-		// only manifest on one or the other depending on how the
-		// operator misconfigured records.
 		go func(dom string) {
 			defer wg.Done()
-			res := probe(ctx, r, c.Resolver, dom)
-			if c.OnResult != nil {
-				c.OnResult(res)
-			}
+			c.dispatch(probe(ctx, r, c.Resolver, dom))
 		}(d)
 		go func(dom string) {
 			defer wg.Done()
-			res := probe(ctx, r, c.Resolver, "any."+dom)
-			if c.OnResult != nil {
-				c.OnResult(res)
-			}
+			c.dispatch(probe(ctx, r, c.Resolver, canary+"."+dom))
 		}(d)
 	}
 	wg.Wait()
+}
+
+// dispatch routes one Result to OnResult and, on edge transitions,
+// OnTransition.
+func (c *Checker) dispatch(res Result) {
+	if c.OnResult != nil {
+		c.OnResult(res)
+	}
+	if c.OnTransition == nil {
+		return
+	}
+	// Only positive answers count; errors don't flip transition state.
+	if res.Err != nil {
+		return
+	}
+	c.stateMu.Lock()
+	if c.state == nil {
+		c.state = make(map[string]bool)
+	}
+	prev := c.state[res.Domain]
+	c.state[res.Domain] = res.Violation
+	c.stateMu.Unlock()
+	if prev != res.Violation {
+		c.OnTransition(res.Domain, res.Violation, res.Answers, res.Resolver)
+	}
+}
+
+func (c *Checker) canaryLabel() string {
+	c.canaryMu.Lock()
+	defer c.canaryMu.Unlock()
+	if c.canary != "" {
+		return c.canary
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fall back to a stable label; collision risk is acceptable.
+		c.canary = canaryPrefix + "fallback"
+	} else {
+		c.canary = canaryPrefix + hex.EncodeToString(b[:])
+	}
+	return c.canary
 }
 
 func buildResolver(addr string) *net.Resolver {

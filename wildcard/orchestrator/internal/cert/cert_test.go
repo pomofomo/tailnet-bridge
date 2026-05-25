@@ -157,9 +157,36 @@ func TestValidate_NoSAN(t *testing.T) {
 	}
 }
 
-// Validate's chain-verification step fails for our self-signed certs.
-// Tests of the chain step would need a real CA — left to integration.
-// The SAN/expiry checks above cover the orchestrator's hot path.
+// ValidateWithRoots exposes the chain-verification step with a custom
+// root pool; tests below use the self-signed leaf as its own root.
+func TestValidateWithRoots_ChainOK(t *testing.T) {
+	cPEM, kPEM := genWildcardCert(t, "smith.ts.example.com",
+		time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	cp, kp := writePair(t, cPEM, kPEM)
+	b, err := Load(cp, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(b.Leaf)
+	if err := ValidateWithRoots(b, "smith.ts.example.com", roots, time.Now()); err != nil {
+		t.Errorf("ValidateWithRoots with self-as-root should succeed: %v", err)
+	}
+}
+
+func TestValidateWithRoots_ChainRejected(t *testing.T) {
+	cPEM, kPEM := genWildcardCert(t, "smith.ts.example.com",
+		time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	cp, kp := writePair(t, cPEM, kPEM)
+	b, err := Load(cp, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Empty root pool → chain verification fails.
+	if err := ValidateWithRoots(b, "smith.ts.example.com", x509.NewCertPool(), time.Now()); err == nil {
+		t.Error("expected chain-verification failure with empty roots")
+	}
+}
 
 func TestSansCover(t *testing.T) {
 	cases := []struct {

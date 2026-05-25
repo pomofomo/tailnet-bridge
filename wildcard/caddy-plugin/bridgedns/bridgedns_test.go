@@ -115,3 +115,14 @@ func TestHandle_CaseInsensitive(t *testing.T) {
 		t.Errorf("case folding broke: %+v", resp)
 	}
 }
+
+func TestHandle_DeepLabelNXDomain(t *testing.T) {
+	rs := newRS(netip.MustParseAddr("100.64.0.42"))
+	resp := ask(t, rs, "a.b.smith.ts.example.com", dns.TypeA)
+	if resp.Rcode != dns.RcodeNameError {
+		t.Errorf("two-labels-down should NXDOMAIN, got rcode %d", resp.Rcode)
+	}
+	if len(resp.Answer) != 0 {
+		t.Errorf("two-labels-down should have no answers, got %v", resp.Answer)
+	}
+}

@@ -11,49 +11,35 @@
 # fully supported; this one is here so you don't have to click through
 # the admin console N times if you join many communities.
 #
-# Status: STUB. Argument parsing and dry-run are wired; the Tailscale API
-# calls are not yet implemented. See SPEC §7.3.
+# The Tailscale API exposes split-DNS as a JSON map of domain → list of
+# nameserver addresses. PATCH semantics merge keys; we PATCH only the
+# community domain so existing entries are preserved.
+#
+# See: https://tailscale.com/api#tag/dns
 
 set -euo pipefail
 
 usage() {
-  cat <<EOF
-Usage: $(basename "$0") [options]
+  cat <<USAGE
+Usage: setup-personal-split-dns.sh --community-domain <community>.ts.<base> \\
+                                   --bridge-tailnet-ip <ip> \\
+                                   --api-key <tskey-api-...> \\
+                                   [--tailnet <personal-tailnet>] \\
+                                   [--port <port>] \\
+                                   [--dry-run]
 
-Configure Split DNS on YOUR personal tailnet so that lookups for
-<community-domain> route to the bridge's per-community listener IP.
+Sets the Tailscale Split DNS entry on the personal tailnet so that
+<service>.<community-domain> resolves to the bridge's tailnet IP. The
+bridge runs an embedded DNS responder on UDP/<port> (default 53) bound
+to its tailnet listener for that community.
 
-This script:
-  1. Reads your personal tailnet's current DNS settings.
-  2. Adds (or replaces) a Split DNS entry mapping <community-domain>
-     to <bridge-tailnet-ip>:53.
-  3. Writes the modified settings back.
+The API key must have \`dns:write\` scope.
 
-After this, devices on your personal tailnet that try to resolve
-<service>.<community-domain> will ask the bridge, which answers with
-its own personal-tailnet IP. The bridge then terminates TLS and
-reverse-proxies to the community.
-
-Required:
-  --community-domain <fqdn>   The community's subdomain (e.g.
-                              smithfamily.ts.example.com).
-  --bridge-tailnet-ip <ip>    The bridge's personal-tailnet IP for this
-                              community's listener node. After first
-                              startup, find it in:
-                                docker compose logs bridge
-                              or the Tailscale admin console under
-                              the bridge node for this community.
-  --api-key <key>             Tailscale API key for YOUR personal tailnet,
-                              with dns:write scope (tskey-api-…).
-
-Optional:
-  --tailnet <name>            Personal tailnet name. Defaults to "-"
-                              (the default tailnet of the API key).
-  --port <port>               DNS port. Default 53.
-  --dry-run                   Print the API requests that would be made,
-                              exit 0.
-  --help                      Show this message.
-EOF
+Flags:
+  --tailnet <name>    Defaults to "-" (the API key's default tailnet).
+  --port <n>          UDP port the bridge listens on; default 53.
+  --dry-run           Print the curl invocations this would run, then exit 0.
+USAGE
 }
 
 # --- argument parsing -----------------------------------------------------
@@ -67,21 +53,21 @@ DRY_RUN=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --community-domain)  COMMUNITY_DOMAIN="$2"; shift 2 ;;
-    --bridge-tailnet-ip) BRIDGE_IP="$2"; shift 2 ;;
-    --api-key)           API_KEY="$2"; shift 2 ;;
-    --tailnet)           TAILNET="$2"; shift 2 ;;
-    --port)              PORT="$2"; shift 2 ;;
-    --dry-run)           DRY_RUN=1; shift ;;
-    --help|-h)           usage; exit 0 ;;
-    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    --community-domain)  COMMUNITY_DOMAIN="$2"; shift 2;;
+    --bridge-tailnet-ip) BRIDGE_IP="$2"; shift 2;;
+    --api-key)           API_KEY="$2"; shift 2;;
+    --tailnet)           TAILNET="$2"; shift 2;;
+    --port)              PORT="$2"; shift 2;;
+    --dry-run)           DRY_RUN=1; shift;;
+    -h|--help)           usage; exit 0;;
+    *) echo "unknown flag: $1" >&2; usage >&2; exit 2;;
   esac
 done
 
 require() {
-  local name="$1" val="$2"
-  if [ -z "$val" ]; then
-    echo "error: --$name is required" >&2
+  if [ -z "$2" ]; then
+    echo "missing required --$1" >&2
+    usage >&2
     exit 2
   fi
 }
@@ -90,38 +76,64 @@ require bridge-tailnet-ip "$BRIDGE_IP"
 require api-key           "$API_KEY"
 
 API_BASE="https://api.tailscale.com/api/v2"
-NAMESERVERS_URL="$API_BASE/tailnet/$TAILNET/dns/nameservers"
+SPLIT_URL="$API_BASE/tailnet/$TAILNET/dns/split-dns"
 RESOLVER="${BRIDGE_IP}:${PORT}"
 
+PAYLOAD=$(printf '{"%s":["%s"]}' "$COMMUNITY_DOMAIN" "$RESOLVER")
+
 if [ "$DRY_RUN" -eq 1 ]; then
-  cat <<EOF
-[dry-run] would call:
-
-  GET  $NAMESERVERS_URL
-  → read the current "dns" config (split-DNS routes + global nameservers)
-
-  PATCH $NAMESERVERS_URL
-  → add (or replace) the split-DNS entry for
-        domain   = "$COMMUNITY_DOMAIN"
-        resolver = "$RESOLVER"
-
-  Then verify from a personal-tailnet device:
-    dig +short @100.x.y.z wiki.$COMMUNITY_DOMAIN
-    # expect: $BRIDGE_IP
-EOF
+  echo "would PATCH:"
+  echo "  curl -fsS -u '<api-key>:' -X PATCH \\"
+  echo "       -H 'Content-Type: application/json' \\"
+  echo "       -d '$PAYLOAD' \\"
+  echo "       '$SPLIT_URL'"
+  echo
+  echo "merges {\"$COMMUNITY_DOMAIN\":[\"$RESOLVER\"]} into the existing"
+  echo "split-dns map; other domains are preserved."
   exit 0
 fi
 
 # --- execute --------------------------------------------------------------
-# TODO(impl): implement per Tailscale's DNS API docs.
-#   1. GET the current dns config.
-#   2. Merge: set settings.dns.splitDNS["$COMMUNITY_DOMAIN"] = ["$RESOLVER"].
-#      Preserve all other split-DNS entries — never replace the whole map.
-#   3. PATCH/POST the merged document back.
-#   4. On non-2xx, print the response body and exit non-zero.
-#   5. Optional verification: shell out to `dig` against a personal-tailnet
-#      resolver and confirm <some-service>.<community-domain> resolves to
-#      $BRIDGE_IP.
 
-echo "error: not yet implemented; pass --dry-run to see the plan" >&2
-exit 99
+if ! command -v curl >/dev/null 2>&1; then
+  echo "error: curl not found on PATH" >&2
+  exit 127
+fi
+
+echo "current split-DNS map (before):"
+curl -fsS -u "$API_KEY:" "$SPLIT_URL" || echo "  (unable to fetch current state)"
+echo
+
+http_body=$(mktemp)
+trap 'rm -f "$http_body"' EXIT
+
+http_code=$(curl -sS -u "$API_KEY:" -X PATCH \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD" \
+  -o "$http_body" \
+  -w "%{http_code}" \
+  "$SPLIT_URL")
+
+if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+  echo "Tailscale API returned HTTP $http_code:" >&2
+  cat "$http_body" >&2
+  exit 1
+fi
+
+echo "OK: PATCH $SPLIT_URL returned HTTP $http_code"
+echo
+
+echo "new split-DNS map:"
+curl -fsS -u "$API_KEY:" "$SPLIT_URL"
+echo
+
+cat <<EOF
+
+Done. From any personal-tailnet device, queries for *.${COMMUNITY_DOMAIN}
+will be routed to $RESOLVER (your bridge). The bridge answers DNS only
+for hostnames under that exact zone; everything else returns REFUSED.
+
+Verify with:
+  dig +short some-service.${COMMUNITY_DOMAIN}
+The answer should be your bridge's tailnet IP ($BRIDGE_IP).
+EOF

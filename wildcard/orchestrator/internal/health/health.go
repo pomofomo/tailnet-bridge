@@ -6,6 +6,7 @@
 package health
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -30,7 +31,8 @@ type Snapshot struct {
 	CertError      string    `json:"cert_error,omitempty"`
 
 	// DNSLeak holds the most recent dnscheck violation for this
-	// community's domain (or any.<domain>). nil means no current leak.
+	// community's domain (or a probed subdomain). nil means no
+	// current leak.
 	DNSLeak *DNSLeak `json:"dns_leak,omitempty"`
 }
 
@@ -50,7 +52,10 @@ type Store struct {
 	// domains is the set of community.id ↔ community.domain mappings
 	// used to attribute dnscheck Results back to a community. The
 	// poller calls SetDomain on every successful Config load.
-	domains map[string]string // id -> domain
+	domains map[string]string // id → domain
+	// reverse caches the domain → id mapping so error-page renders
+	// and dnscheck dispatch don't walk `domains` each time.
+	reverse map[string]string
 }
 
 // NewStore returns an empty Store.
@@ -58,15 +63,21 @@ func NewStore() *Store {
 	return &Store{
 		data:    make(map[string]Snapshot),
 		domains: make(map[string]string),
+		reverse: make(map[string]string),
 	}
 }
 
 // SetDomain registers a community's primary domain. Used by dnscheck
-// result routing.
+// result routing and host → community-id lookup. Idempotent.
 func (s *Store) SetDomain(communityID, domain string) {
+	dom := strings.ToLower(strings.TrimSuffix(domain, "."))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.domains[communityID] = domain
+	if old, ok := s.domains[communityID]; ok && old != dom {
+		delete(s.reverse, old)
+	}
+	s.domains[communityID] = dom
+	s.reverse[dom] = communityID
 }
 
 // Set replaces the snapshot for one community.
@@ -106,17 +117,15 @@ func (s *Store) All() map[string]Snapshot {
 
 // RecordDNSResult routes one dnscheck.Result to the matching community's
 // Snapshot. Probes that don't map to a registered domain are ignored.
+//
+// A Result Domain matches a community when it is either the community
+// domain itself or a strict subdomain of it (handles the per-process
+// canary label dnscheck appends).
 func (s *Store) RecordDNSResult(r dnscheck.Result) {
+	probed := strings.ToLower(strings.TrimSuffix(r.Domain, "."))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	matched := ""
-	for id, dom := range s.domains {
-		// r.Domain is either <community.domain> or "any.<community.domain>".
-		if r.Domain == dom || r.Domain == "any."+dom {
-			matched = id
-			break
-		}
-	}
+	matched := s.matchCommunityLocked(probed)
 	if matched == "" {
 		return
 	}
@@ -129,10 +138,10 @@ func (s *Store) RecordDNSResult(r dnscheck.Result) {
 			Answers:  append([]string(nil), r.Answers...),
 		}
 	} else if r.Err == nil {
-		// Healthy result for the domain. Clear leak only if it
-		// referred to the same probe target (don't clear when a
-		// stale "any.<domain>" leak is still pending and the apex
-		// just came back clean).
+		// Healthy result for this probe target. Clear leak only if
+		// the snapshot's existing leak was for THIS exact probe — a
+		// stale leak on the canary should not be cleared by an apex
+		// success.
 		if snap.DNSLeak != nil && snap.DNSLeak.Domain == r.Domain {
 			snap.DNSLeak = nil
 		}
@@ -144,28 +153,45 @@ func (s *Store) RecordDNSResult(r dnscheck.Result) {
 // is a suffix of host (with a single label in between — `<svc>.<domain>`).
 // Returns "" if no match.
 func (s *Store) CommunityIDForHost(host string) string {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "" {
+		return ""
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for id, dom := range s.domains {
-		// Match "<svc>.<dom>" — exactly one label between.
-		if len(host) > len(dom)+1 && host[len(host)-len(dom)-1] == '.' &&
-			host[len(host)-len(dom):] == dom {
-			// Ensure the bit before "." has no dots.
-			label := host[:len(host)-len(dom)-1]
-			dot := false
-			for i := 0; i < len(label); i++ {
-				if label[i] == '.' {
-					dot = true
-					break
-				}
-			}
-			if !dot {
-				return id
-			}
-		}
-		if host == dom {
+	// Apex match: exact community domain.
+	if id, ok := s.reverse[h]; ok {
+		return id
+	}
+	// One-label-down match: "<svc>.<domain>".
+	if dot := strings.IndexByte(h, '.'); dot >= 0 {
+		parent := h[dot+1:]
+		// label before dot must contain no further dots — guaranteed
+		// by the IndexByte index, so just look the parent up.
+		if id, ok := s.reverse[parent]; ok {
 			return id
 		}
 	}
 	return ""
+}
+
+// matchCommunityLocked finds the community whose registered domain is
+// equal to probed or a parent of probed. Caller must hold s.mu.
+func (s *Store) matchCommunityLocked(probed string) string {
+	if id, ok := s.reverse[probed]; ok {
+		return id
+	}
+	// Walk parents one label at a time: dnscheck probes the apex and
+	// also a canary subdomain like "bridge-canary-xxxx.<domain>".
+	rest := probed
+	for {
+		dot := strings.IndexByte(rest, '.')
+		if dot < 0 {
+			return ""
+		}
+		rest = rest[dot+1:]
+		if id, ok := s.reverse[rest]; ok {
+			return id
+		}
+	}
 }

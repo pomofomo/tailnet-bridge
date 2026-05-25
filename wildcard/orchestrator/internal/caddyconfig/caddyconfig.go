@@ -21,6 +21,14 @@
 //   - The transport's `tls.server_name` is set to the CANONICAL name
 //     (e.g. wiki.smithfamily.ts.example.com), not the dial target
 //     (wiki.smithfamily.ts.net), so the upstream's wildcard cert validates.
+//
+// Cert-failed communities (SPEC §12.1): when a community's wildcard cert
+// is missing or invalid, we still emit its personal-side listener and
+// bridgedns entry, but bind a self-signed fallback cert (from
+// internal/fallbackcert) and route every host through the bridge error
+// page. The browser will show a cert warning, but after the user clicks
+// through they reach a friendly explanation instead of an opaque network
+// error.
 package caddyconfig
 
 import (
@@ -42,6 +50,13 @@ type Input struct {
 	Config      *config.Config
 	Directories map[string]*directory.Directory
 	Certs       map[string]*cert.Bundle
+
+	// FallbackCertPath / FallbackKeyPath are used when a community's
+	// real cert is missing or invalid (SPEC §12.1). Both must be set
+	// or both empty; if empty, cert-failed communities are skipped
+	// from the output entirely (the old behaviour).
+	FallbackCertPath string
+	FallbackKeyPath  string
 }
 
 // PersonalNodeName returns the tsnet node id used for the personal-side
@@ -52,75 +67,108 @@ func PersonalNodeName(id string) string { return "personal-" + id }
 // the community tailnet for the given community.
 func DialerNodeName(id string) string { return "community-dialer-" + id }
 
-// Build emits the Caddy JSON for the given inputs. A community is
-// included in the listener config only if BOTH Directories and Certs
-// have an entry for it; communities with missing/invalid certs are
-// silently omitted (the status server still reports them).
+const fallbackTag = "fallback"
+
+func certTag(id string) string { return "cert-" + id }
+
+// Build emits the Caddy JSON for the given inputs.
+//
+// Every community in cfg.Communities is reachable in the output, even
+// when its cert or directory is missing — we still bind the personal
+// listener and DNS responder so the user gets the /__bridge_error page
+// instead of an opaque network failure. A community is dropped only if
+// it has neither a real cert nor a fallback configured.
 func Build(in Input) ([]byte, error) {
 	if in.Config == nil {
 		return nil, errors.New("caddyconfig: nil config")
 	}
+	if (in.FallbackCertPath == "") != (in.FallbackKeyPath == "") {
+		return nil, errors.New("caddyconfig: FallbackCertPath and FallbackKeyPath must both be set or both empty")
+	}
 	cfg := in.Config
+	hasFallback := in.FallbackCertPath != ""
 
-	// Sort the eligible community IDs for deterministic output.
-	ids := make([]string, 0, len(cfg.Communities))
-	communities := make(map[string]config.Community, len(cfg.Communities))
+	// Determine which communities make it into the output, and which
+	// are "healthy" (real cert + directory with services → reverse
+	// proxy) versus "degraded" (error-page only).
+	type state struct {
+		c         config.Community
+		hasCert   bool
+		hasDir    bool
+		serviceOK bool // hasCert && hasDir && len(services) > 0
+	}
+	included := make([]state, 0, len(cfg.Communities))
 	for _, c := range cfg.Communities {
-		communities[c.ID] = c
-		_, hasDir := in.Directories[c.ID]
-		_, hasCert := in.Certs[c.ID]
-		if !hasDir || !hasCert {
+		st := state{c: c}
+		_, st.hasCert = in.Certs[c.ID]
+		dir, hasDir := in.Directories[c.ID]
+		st.hasDir = hasDir
+		st.serviceOK = st.hasCert && st.hasDir && dir != nil && len(dir.Services) > 0
+		if !st.hasCert && !hasFallback {
+			// No real cert and no fallback to bind a listener with —
+			// nothing useful we can emit for this community.
 			continue
 		}
-		ids = append(ids, c.ID)
+		included = append(included, st)
 	}
-	sort.Strings(ids)
+	sort.Slice(included, func(i, j int) bool { return included[i].c.ID < included[j].c.ID })
 
-	// Build apps.tailscale.nodes (every active community contributes
-	// one personal listener + one community dialer).
-	tsNodes := make(map[string]any, 2*len(ids))
-	for _, id := range ids {
-		c := communities[id]
-		tsNodes[PersonalNodeName(id)] = map[string]any{
+	// tsnet nodes. Personal listener always exists for every included
+	// community. Community-side dialer is only useful if we'll emit
+	// service routes — skip it otherwise (H2).
+	tsNodes := make(map[string]any, 2*len(included))
+	for _, st := range included {
+		tsNodes[PersonalNodeName(st.c.ID)] = map[string]any{
 			"auth_key":  cfg.Personal.AuthKey,
-			"hostname":  id + "-bridge",
-			"state_dir": filepath.Join(cfg.StateDir, PersonalNodeName(id)),
+			"hostname":  st.c.ID + "-bridge",
+			"state_dir": filepath.Join(cfg.StateDir, PersonalNodeName(st.c.ID)),
 			"ephemeral": false,
 		}
-		tsNodes[DialerNodeName(id)] = map[string]any{
-			"auth_key":  c.AuthKey,
-			"hostname":  cfg.Personal.BridgeHostname,
-			"state_dir": filepath.Join(cfg.StateDir, DialerNodeName(id)),
-			"ephemeral": false,
+		if st.serviceOK {
+			tsNodes[DialerNodeName(st.c.ID)] = map[string]any{
+				"auth_key":  st.c.AuthKey,
+				"hostname":  cfg.Personal.BridgeHostname,
+				"state_dir": filepath.Join(cfg.StateDir, DialerNodeName(st.c.ID)),
+				"ephemeral": false,
+			}
 		}
 	}
 
-	// Build apps.tls.certificates.load_files. One entry per active
-	// community, paths read from config (not from cert.Bundle — the
-	// Bundle is the validation result; Caddy re-reads the file).
-	loadFiles := make([]map[string]any, 0, len(ids))
-	for _, id := range ids {
-		c := communities[id]
+	// load_files: one entry per community with a real cert, plus a
+	// single fallback entry if any community needs it.
+	loadFiles := make([]map[string]any, 0, len(included)+1)
+	fallbackNeeded := false
+	for _, st := range included {
+		if st.hasCert {
+			loadFiles = append(loadFiles, map[string]any{
+				"certificate": st.c.CertPath,
+				"key":         st.c.KeyPath,
+				"tags":        []string{certTag(st.c.ID)},
+			})
+		} else {
+			fallbackNeeded = true
+		}
+	}
+	if fallbackNeeded {
 		loadFiles = append(loadFiles, map[string]any{
-			"certificate": c.CertPath,
-			"key":         c.KeyPath,
-			"tags":        []string{id},
+			"certificate": in.FallbackCertPath,
+			"key":         in.FallbackKeyPath,
+			"tags":        []string{fallbackTag},
 		})
 	}
 
-	// Build apps.http.servers: one server per community.
-	servers := make(map[string]any, len(ids))
-	for _, id := range ids {
-		servers[id] = buildServer(cfg, communities[id], in.Directories[id])
+	// http servers: one per included community.
+	servers := make(map[string]any, len(included))
+	for _, st := range included {
+		servers[st.c.ID] = buildServer(cfg, st.c, in.Directories[st.c.ID], st.hasCert, st.serviceOK)
 	}
 
-	// Build apps.bridgedns.nodes: one DNS responder bound to each
-	// community's tsnet listener node (SPEC §10.1).
-	bridgednsNodes := make(map[string]any, len(ids))
-	for _, id := range ids {
-		bridgednsNodes[id] = map[string]any{
-			"tsnet_node": PersonalNodeName(id),
-			"domain":     communities[id].Domain,
+	// bridgedns nodes: one per included community.
+	bridgednsNodes := make(map[string]any, len(included))
+	for _, st := range included {
+		bridgednsNodes[st.c.ID] = map[string]any{
+			"tsnet_node": PersonalNodeName(st.c.ID),
+			"domain":     st.c.Domain,
 			"port":       53,
 		}
 	}
@@ -154,34 +202,43 @@ func Build(in Input) ([]byte, error) {
 	return json.MarshalIndent(out, "", "  ")
 }
 
-// buildServer emits one apps.http.servers[<id>] entry, one route per
-// service in the directory plus the catch-all unknown-subdomain handler.
-func buildServer(cfg *config.Config, c config.Community, dir *directory.Directory) map[string]any {
+// buildServer emits one apps.http.servers[<id>] entry.
+//
+// When serviceOK is true we emit one route per directory service plus a
+// catch-all unknown-subdomain handler. When false (no cert, no dir, no
+// services), every host under the wildcard routes to the error page so
+// the user gets a coherent explanation rather than a connection error.
+func buildServer(cfg *config.Config, c config.Community, dir *directory.Directory, hasCert, serviceOK bool) map[string]any {
 	wildcard := "*." + c.Domain
 
-	// Sort services by name for deterministic routes ordering.
-	svcs := make([]directory.Service, len(dir.Services))
-	copy(svcs, dir.Services)
-	sort.Slice(svcs, func(i, j int) bool { return svcs[i].Name < svcs[j].Name })
-
-	routes := make([]map[string]any, 0, len(svcs)+1)
-	for _, svc := range svcs {
-		routes = append(routes, buildServiceRoute(cfg, c, dir, svc))
+	routes := make([]map[string]any, 0, 4)
+	if serviceOK {
+		svcs := make([]directory.Service, len(dir.Services))
+		copy(svcs, dir.Services)
+		sort.Slice(svcs, func(i, j int) bool { return svcs[i].Name < svcs[j].Name })
+		for _, svc := range svcs {
+			routes = append(routes, buildServiceRoute(cfg, c, dir, svc))
+		}
 	}
-	// Catch-all unknown subdomain under the wildcard → error page.
+	// Catch-all wildcard hit (typo, unknown service, degraded community)
+	// → error page. Always last; matches anything under *.<domain> that
+	// the per-service routes didn't terminate on.
 	routes = append(routes, map[string]any{
 		"match":    []map[string]any{{"host": []string{wildcard}}},
 		"handle":   errorHandle(cfg),
 		"terminal": true,
 	})
 
+	tag := certTag(c.ID)
+	if !hasCert {
+		tag = fallbackTag
+	}
+
 	return map[string]any{
 		"listen":          []string{"tailscale/" + PersonalNodeName(c.ID) + ":443"},
 		"automatic_https": map[string]any{"disable": true},
-		// One default TLS policy. With cert tags, Caddy picks the cert
-		// whose tag matches the SNI / wildcard.
 		"tls_connection_policies": []map[string]any{
-			{"certificate_selection": map[string]any{"any_tag": []string{c.ID}}},
+			{"certificate_selection": map[string]any{"any_tag": []string{tag}}},
 		},
 		"routes": routes,
 		"errors": map[string]any{
@@ -199,14 +256,14 @@ func buildServiceRoute(cfg *config.Config, c config.Community, dir *directory.Di
 	// Request headers: preserve Host (canonical name is the same on
 	// both sides); propagate Tailscale identity placeholders.
 	reqSet := map[string][]string{
-		"Host":                    {"{http.request.host}"},
-		"X-Forwarded-Host":        {"{http.request.host}"},
-		"X-Forwarded-Proto":       {"https"},
-		"X-Tailscale-User":        {"{http.auth.user.tailscale_login}"},
-		"X-Tailscale-User-Email":  {"{http.auth.user.tailscale_user}"},
-		"X-Tailscale-User-Name":   {"{http.auth.user.tailscale_name}"},
-		"X-Tailscale-Node":        {"{http.auth.user.tailscale_node}"},
-		"X-Tailscale-Tailnet":     {"{http.auth.user.tailscale_tailnet}"},
+		"Host":                   {"{http.request.host}"},
+		"X-Forwarded-Host":       {"{http.request.host}"},
+		"X-Forwarded-Proto":      {"https"},
+		"X-Tailscale-User":       {"{http.auth.user.tailscale_login}"},
+		"X-Tailscale-User-Email": {"{http.auth.user.tailscale_user}"},
+		"X-Tailscale-User-Name":  {"{http.auth.user.tailscale_name}"},
+		"X-Tailscale-Node":       {"{http.auth.user.tailscale_node}"},
+		"X-Tailscale-Tailnet":    {"{http.auth.user.tailscale_tailnet}"},
 	}
 
 	reverseProxy := map[string]any{
@@ -262,4 +319,3 @@ func errorHandle(cfg *config.Config) []map[string]any {
 //
 //goland:noinspection GoUnusedExportedFunction
 func Hash(out []byte) [32]byte { return sha256.Sum256(out) }
-

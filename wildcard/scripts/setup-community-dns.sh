@@ -7,45 +7,36 @@
 # Frequency: once per community (re-run only if the resolver IP changes)
 # Implementation: bash + curl against the Tailscale REST API.
 #
-# Status: STUB. Argument parsing and dry-run are wired; the Tailscale API
-# calls are not yet implemented. See SPEC §6.1.
+# The Tailscale API exposes split-DNS as a JSON map of domain → list of
+# nameserver addresses. PATCH semantics merge keys; we PATCH only the
+# community domain so existing entries (other split-DNS zones, magicDNS
+# search paths, etc.) are preserved.
+#
+# See: https://tailscale.com/api#tag/dns
 
 set -euo pipefail
 
 usage() {
-  cat <<EOF
-Usage: $(basename "$0") [options]
+  cat <<USAGE
+Usage: setup-community-dns.sh --community-domain <community>.ts.<base> \\
+                              --tailnet <community-tailnet> \\
+                              --api-key <tskey-api-...> \\
+                              --resolver-ip <ip[:port]> \\
+                              [--dry-run]
 
-Configure Split DNS inside a community tailnet for <community-domain>.
+Sets the Tailscale Split DNS entry for <community-domain> inside the
+community tailnet so that <service>.<community-domain> resolves to
+<resolver-ip>. The resolver may be a CoreDNS / Unbound on the tailnet
+that returns the community-side service IPs (SPEC §6.1).
 
-This script:
-  1. Reads the community tailnet's current DNS settings.
-  2. Adds (or replaces) a Split DNS entry mapping <community-domain> to
-     <resolver-ip>.
-  3. Writes the modified settings back.
+The API key must have \`dns:write\` scope. Generate one at
+https://login.tailscale.com/admin/settings/keys.
 
-The resolver at <resolver-ip> is responsible for answering A queries for
-<service>.<community-domain> with the service's community-tailnet IP.
-Most communities run a small CoreDNS or Unbound on a community-tailnet
-host for this purpose; SPEC §6.1 has a sample config.
-
-Required:
-  --community-domain <fqdn>   The community's subdomain (e.g.
-                              smithfamily.ts.example.com).
-  --tailnet <name>            Community tailnet name (e.g. smithfamily.ts.net,
-                              or "-" for the default of the supplied API key).
-  --api-key <key>             Tailscale API key (tskey-api-…). MUST be scoped
-                              to the community tailnet, not your personal one.
-  --resolver-ip <ip[:port]>   Address of the community-side resolver that
-                              answers <community-domain> queries.
-
-Optional:
-  --dry-run                   Print the API requests that would be made and exit.
-  --help                      Show this message.
-
-Tip: read the API key from a file or env var to keep it out of shell history:
-  --api-key "\$(cat ~/.tailscale-community-api-key)"
-EOF
+Flags:
+  --tailnet <name>    e.g. smithfamily.ts.net (without protocol).
+  --resolver-ip <ip>  IP, or IP:port. Bare IP defaults to port 53.
+  --dry-run           Print the curl invocations this would run, then exit 0.
+USAGE
 }
 
 # --- argument parsing -----------------------------------------------------
@@ -58,20 +49,20 @@ DRY_RUN=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --community-domain) COMMUNITY_DOMAIN="$2"; shift 2 ;;
-    --tailnet)          TAILNET="$2"; shift 2 ;;
-    --api-key)          API_KEY="$2"; shift 2 ;;
-    --resolver-ip)      RESOLVER_IP="$2"; shift 2 ;;
-    --dry-run)          DRY_RUN=1; shift ;;
-    --help|-h)          usage; exit 0 ;;
-    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    --community-domain) COMMUNITY_DOMAIN="$2"; shift 2;;
+    --tailnet)          TAILNET="$2"; shift 2;;
+    --api-key)          API_KEY="$2"; shift 2;;
+    --resolver-ip)      RESOLVER_IP="$2"; shift 2;;
+    --dry-run)          DRY_RUN=1; shift;;
+    -h|--help)          usage; exit 0;;
+    *) echo "unknown flag: $1" >&2; usage >&2; exit 2;;
   esac
 done
 
 require() {
-  local name="$1" val="$2"
-  if [ -z "$val" ]; then
-    echo "error: --$name is required" >&2
+  if [ -z "$2" ]; then
+    echo "missing required --$1" >&2
+    usage >&2
     exit 2
   fi
 }
@@ -80,43 +71,71 @@ require tailnet          "$TAILNET"
 require api-key          "$API_KEY"
 require resolver-ip      "$RESOLVER_IP"
 
-# Tailscale API: see https://tailscale.com/api
+# Normalize resolver into "ip:port" form; Tailscale's split-dns map values
+# accept either bare ip or ip:port.
+case "$RESOLVER_IP" in
+  *:*) ;;            # already ip:port (or IPv6 form)
+  *)   RESOLVER_IP="${RESOLVER_IP}:53";;
+esac
+
 API_BASE="https://api.tailscale.com/api/v2"
-NAMESERVERS_URL="$API_BASE/tailnet/$TAILNET/dns/nameservers"
+SPLIT_URL="$API_BASE/tailnet/$TAILNET/dns/split-dns"
+
+PAYLOAD=$(printf '{"%s":["%s"]}' "$COMMUNITY_DOMAIN" "$RESOLVER_IP")
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  cat <<EOF
-[dry-run] would call:
-
-  GET  $NAMESERVERS_URL
-  → read the current "dns" config (split-DNS routes + global nameservers)
-
-  PATCH $NAMESERVERS_URL
-  → add (or replace) the split-DNS entry for
-        domain   = "$COMMUNITY_DOMAIN"
-        resolver = "$RESOLVER_IP"
-
-  Then verify with:
-    dig +short @<any-community-tailnet-node> \\
-        wiki.$COMMUNITY_DOMAIN
-EOF
+  echo "would PATCH:"
+  echo "  curl -fsS -u '<api-key>:' -X PATCH \\"
+  echo "       -H 'Content-Type: application/json' \\"
+  echo "       -d '$PAYLOAD' \\"
+  echo "       '$SPLIT_URL'"
+  echo
+  echo "merges {\"$COMMUNITY_DOMAIN\":[\"$RESOLVER_IP\"]} into the existing"
+  echo "split-dns map; other domains are preserved."
   exit 0
 fi
 
 # --- execute --------------------------------------------------------------
-# TODO(impl): implement per Tailscale's DNS API docs.
-#   1. curl -H "Authorization: Bearer $API_KEY" "$NAMESERVERS_URL"
-#      to fetch the current dns block. (Tailscale uses a single
-#      "split DNS" map keyed by domain; we MUST preserve other entries.)
-#   2. Merge: set settings.dns.splitDNS["$COMMUNITY_DOMAIN"] = ["$RESOLVER_IP"].
-#   3. PATCH/POST back the merged document with appropriate Content-Type.
-#   4. On non-2xx, print the response body and exit non-zero.
-#   5. Verification step: optionally dig a known service name and confirm
-#      it resolves to the expected community-tailnet IP.
-#
-# As of writing, the relevant API surface is the per-tailnet DNS endpoint;
-# confirm the exact request/response shape against the current docs before
-# implementing.
 
-echo "error: not yet implemented; pass --dry-run to see the plan" >&2
-exit 99
+if ! command -v curl >/dev/null 2>&1; then
+  echo "error: curl not found on PATH" >&2
+  exit 127
+fi
+
+# Show current state for the admin's reference. Non-fatal on failure
+# (some tailnets start with an empty map and the GET returns 200 {} ).
+echo "current split-DNS map (before):"
+curl -fsS -u "$API_KEY:" "$SPLIT_URL" || echo "  (unable to fetch current state)"
+echo
+
+http_body=$(mktemp)
+trap 'rm -f "$http_body"' EXIT
+
+http_code=$(curl -sS -u "$API_KEY:" -X PATCH \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD" \
+  -o "$http_body" \
+  -w "%{http_code}" \
+  "$SPLIT_URL")
+
+if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+  echo "Tailscale API returned HTTP $http_code:" >&2
+  cat "$http_body" >&2
+  exit 1
+fi
+
+echo "OK: PATCH $SPLIT_URL returned HTTP $http_code"
+echo
+
+echo "new split-DNS map:"
+curl -fsS -u "$API_KEY:" "$SPLIT_URL"
+echo
+
+cat <<EOF
+
+Done. Inside the community tailnet, queries for *.${COMMUNITY_DOMAIN}
+will now be routed to $RESOLVER_IP.
+
+Verify with (from any node in the tailnet):
+  dig +short some-service.${COMMUNITY_DOMAIN}
+EOF

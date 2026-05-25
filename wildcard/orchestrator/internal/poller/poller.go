@@ -59,6 +59,15 @@ type Deps struct {
 	Admin   *adminclient.Client
 	Fetcher Fetcher
 
+	// FallbackCertPath / FallbackKeyPath are passed through to
+	// caddyconfig.Build (SPEC §12.1): when a community's wildcard cert
+	// is missing or invalid, the bridge still binds its listener with
+	// this self-signed pair so the user reaches the /__bridge_error
+	// page (after clicking through the browser cert warning) instead
+	// of an opaque network failure.
+	FallbackCertPath string
+	FallbackKeyPath  string
+
 	// Optional overrides; nil means defaults.
 	Build      func(caddyconfig.Input) ([]byte, error)
 	CertLoader CertLoader
@@ -125,7 +134,10 @@ func Start(ctx context.Context, deps Deps, logger *log.Logger) (*Runner, error) 
 		logger:        logger,
 	}
 
-	// Pre-load certs synchronously; record cert errors in Health.
+	// Pre-load certs synchronously; record cert errors in Health so a
+	// later /__bridge_status query can explain "this community is in
+	// degraded mode". The fallback cert (Deps.FallbackCertPath) is what
+	// keeps the listener bindable for cert-failed communities.
 	r.reloadAllCerts()
 
 	// Register community domains so dnscheck and status can attribute.
@@ -236,6 +248,10 @@ func (r *Runner) pollOnce(ctx context.Context, c config.Community) {
 	}
 
 	if res.NotModified {
+		// 304 implicitly clears LastError: the directory we already
+		// have is still the one the upstream is serving, so any prior
+		// fetch error is no longer current. Callers reading the
+		// snapshot get a single source of truth (current vs. stale).
 		r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
 			s.LastSuccessfulPoll = time.Now()
 			s.LastPollAttempt = time.Now()
@@ -279,11 +295,11 @@ func (r *Runner) runCertWatcher(ctx context.Context) {
 	}
 }
 
-// reloadAllCerts loads every (cert,key) pair synchronously. Failures are
-// recorded in Health but don't abort startup. Returns whether any cert
-// loaded successfully (the caller may use this to decide if a regen is
-// worth attempting).
-func (r *Runner) reloadAllCerts() (anyLoaded bool) {
+// reloadAllCerts loads every (cert,key) pair synchronously. Failures
+// are recorded in Health but don't abort startup; the caller still
+// proceeds to regenerate, because caddyconfig.Build now keeps the
+// listener up using the fallback cert for cert-failed communities.
+func (r *Runner) reloadAllCerts() {
 	for _, c := range r.deps.Config.Communities {
 		b, err := r.loadc.Load(c.CertPath, c.KeyPath)
 		if err != nil {
@@ -315,9 +331,20 @@ func (r *Runner) reloadAllCerts() (anyLoaded bool) {
 			s.CertLastReload = now
 			return s
 		})
-		anyLoaded = true
+		r.warnExpiringSoon(c.ID, b, now)
 	}
-	return anyLoaded
+}
+
+// warnExpiringSoon logs once when a cert has less than cert.MinValidity
+// remaining (SPEC §9.4 step 3). Logs every check round; the dedupe is
+// the operator's tail filter.
+func (r *Runner) warnExpiringSoon(id string, b *cert.Bundle, now time.Time) {
+	left := b.NotAfter.Sub(now)
+	if left <= 0 || left >= cert.MinValidity {
+		return
+	}
+	r.logger.Printf("poller[%s]: WARNING wildcard cert expires in %s (not_after=%s); ask the community admin to rotate (SPEC §6.3)",
+		id, left.Truncate(time.Minute), b.NotAfter.Format(time.RFC3339))
 }
 
 // checkCerts re-loads every cert; returns true if anything changed.
@@ -375,6 +402,7 @@ func (r *Runner) checkCerts(ctx context.Context) (changed bool) {
 			})
 			changed = true
 		}
+		r.warnExpiringSoon(c.ID, b, now)
 	}
 	return changed
 }
@@ -403,9 +431,11 @@ func (r *Runner) regenerate(ctx context.Context) error {
 	r.certsMu.RUnlock()
 
 	jsonBytes, err := r.build(caddyconfig.Input{
-		Config:      r.deps.Config,
-		Directories: dirs,
-		Certs:       certs,
+		Config:           r.deps.Config,
+		Directories:      dirs,
+		Certs:            certs,
+		FallbackCertPath: r.deps.FallbackCertPath,
+		FallbackKeyPath:  r.deps.FallbackKeyPath,
 	})
 	if err != nil {
 		return fmt.Errorf("build: %w", err)

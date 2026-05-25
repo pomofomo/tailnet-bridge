@@ -175,9 +175,13 @@ func (a *App) Stop() error {
 
 // handle answers one DNS message.
 //
-// Behaviour (SPEC §7.3, §10.1):
-//   - `*.<domain>` (A/AAAA): the node's own tailnet IP.
+// Behaviour (SPEC §7.3, §8.2, §10.1):
+//   - `*.<domain>` with exactly one label below the apex (A/AAAA): the
+//     node's own tailnet IP. Matches the wildcard cert coverage.
 //   - `<domain>` (apex): NXDOMAIN.
+//   - Two or more labels below the apex: NXDOMAIN (the wildcard cert
+//     does not cover those names, and SPEC §8.2 forbids dotted service
+//     names).
 //   - Anything outside `<domain>`: REFUSED.
 //   - Malformed: drop silently.
 func (rs *runningServer) handle(w dns.ResponseWriter, r *dns.Msg) {
@@ -198,11 +202,12 @@ func (rs *runningServer) handle(w dns.ResponseWriter, r *dns.Msg) {
 		// Apex: NXDOMAIN. Only children exist.
 		m.Rcode = dns.RcodeNameError
 	case strings.HasSuffix(qname, suffix):
-		// Subdomain — but only one label below the apex
-		// (the wildcard cert covers a single label of *.<domain>).
-		// We still answer for deeper names so an upstream redirect or
-		// resolver doesn't accidentally NXDOMAIN; Caddy's host matcher
-		// will reject deeper hostnames with the catch-all anyway.
+		// Subdomain: only ONE label below the apex is in zone.
+		head := qname[:len(qname)-len(suffix)]
+		if head == "" || strings.ContainsRune(head, '.') {
+			m.Rcode = dns.RcodeNameError
+			break
+		}
 		switch q.Qtype {
 		case dns.TypeA:
 			if rs.addr.Is4() {

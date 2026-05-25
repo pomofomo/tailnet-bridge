@@ -22,7 +22,7 @@ import (
 
 // Server is the HTTP server.
 type Server struct {
-	Addr   string       // e.g. "127.0.0.1:8081"
+	Addr   string // e.g. "127.0.0.1:8081"
 	Health *health.Store
 }
 
@@ -97,9 +97,14 @@ func (s *Server) handleError(w http.ResponseWriter, r *http.Request) {
 		remain := time.Until(snap.CertNotAfter)
 		if remain > 0 {
 			data.CertDaysLeft = int(remain.Hours()) / 24
+			// SPEC §9.4 step 3: <24h is the "expiring soon" threshold.
+			data.CertExpiringSoon = remain < 24*time.Hour
 		} else {
 			data.CertExpired = true
 		}
+	}
+	if !snap.CertLastReload.IsZero() {
+		data.CertLastReload = snap.CertLastReload.UTC().Format(time.RFC3339)
 	}
 	if snap.DNSLeak != nil {
 		data.DNSLeakDomain = snap.DNSLeak.Domain
@@ -112,6 +117,8 @@ func (s *Server) handleError(w http.ResponseWriter, r *http.Request) {
 		data.Diagnosis = "wildcard cert expired"
 	case data.CertError != "":
 		data.Diagnosis = "wildcard cert problem"
+	case data.CertExpiringSoon:
+		data.Diagnosis = "wildcard cert expires soon"
 	case data.LastError != "":
 		data.Diagnosis = "directory or upstream problem"
 	case commID == "":
@@ -156,6 +163,8 @@ type errorPageData struct {
 	CertNotAfter     string
 	CertDaysLeft     int
 	CertExpired      bool
+	CertExpiringSoon bool
+	CertLastReload   string
 	DNSLeakDomain    string
 	DNSLeakAnswers   string
 	Diagnosis        string
@@ -186,6 +195,12 @@ The community admin rotates the cert periodically; if you didn't receive the rot
 {{else if .CertError}}
 <p>The wildcard TLS cert for this community failed validation:</p>
 <div class="err">{{.CertError}}</div>
+{{else if .CertExpiringSoon}}
+<div class="leak">
+<strong>Heads up:</strong> the wildcard TLS cert for this community expires in under 24 hours
+{{if .CertNotAfter}}(not-after: <code>{{.CertNotAfter}}</code>){{end}}.
+Ask the community admin to rotate (SPEC §6.3).
+</div>
 {{else if .LastError}}
 <p>The bridge last saw this error talking to that community:</p>
 <div class="err">{{.LastError}}</div>
@@ -213,6 +228,7 @@ The bridge still works but the wildcard-cert trust model is compromised; tell th
 <p class="meta">
 {{if .LastSuccessful}}Last successful directory poll: {{.LastSuccessful}}.{{end}}
 {{if .CertNotAfter}} Cert not-after: {{.CertNotAfter}}{{if and (gt .CertDaysLeft 0) (not .CertExpired)}} ({{.CertDaysLeft}} days remaining){{end}}.{{end}}
+{{if .CertLastReload}} Last cert rotation picked up: {{.CertLastReload}}.{{end}}
 {{if .CommunityID}} Community id: <code>{{.CommunityID}}</code>.{{end}}
 </p>
 </body>

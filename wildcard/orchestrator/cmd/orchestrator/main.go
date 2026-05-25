@@ -2,18 +2,21 @@
 // variant. It owns the lifecycle described in SPEC §10.3:
 //
 //  1. Parse + validate config.
-//  2. Spawn Caddy with bootstrap.json (admin API only).
-//  3. Wait for Caddy admin to accept connections.
-//  4. Start the status/error server on 127.0.0.1:<orchestrator_error_port>.
-//  5. Bring up one ephemeral tsnet poller node per community, fetch
+//  2. Generate / load the self-signed fallback cert under state_dir so
+//     cert-failed communities still bind a listener (SPEC §12.1).
+//  3. Spawn Caddy with bootstrap.json (admin API only).
+//  4. Wait for Caddy admin to accept connections.
+//  5. Start the status/error server on 127.0.0.1:<orchestrator_error_port>.
+//  6. Bring up one ephemeral tsnet poller node per community, fetch
 //     each directory, validate against the local config's domain.
-//  6. Load + validate every (cert,key) pair. Build the initial Caddy
+//  7. Load + validate every (cert,key) pair. Build the initial Caddy
 //     JSON, POST to admin /load.
-//  7. Start the poller (per-community polling, cert-watch ticker,
+//  8. Start the poller (per-community polling, cert-watch ticker,
 //     SIGHUP fan-out, regen+apply with hash dedupe).
-//  8. Start the dnscheck goroutine: warn if any community domain
+//  9. Start the dnscheck goroutine: warn if any community domain
 //     resolves on the public internet (SPEC §3.5, §9.5).
-//  9. Wait for SIGTERM / SIGINT / unexpected Caddy exit.
+//
+// 10. Wait for SIGTERM / SIGINT / unexpected Caddy exit.
 package main
 
 import (
@@ -33,6 +36,7 @@ import (
 	"bridge/internal/caddyproc"
 	"bridge/internal/config"
 	"bridge/internal/dnscheck"
+	"bridge/internal/fallbackcert"
 	"bridge/internal/health"
 	"bridge/internal/poller"
 	"bridge/internal/status"
@@ -60,6 +64,15 @@ func run(logger *log.Logger) error {
 	logger.Printf("config loaded: %d communities, base=%s, poll=%s, cert_check=%s",
 		len(cfg.Communities), cfg.BaseDomain(), cfg.PollInterval, cfg.CertCheckInterval)
 
+	// Ensure the self-signed fallback cert exists once, under state_dir.
+	// Used for cert-failed communities so the listener still binds and
+	// the user reaches /__bridge_error (SPEC §12.1).
+	fb, err := fallbackcert.Ensure(cfg.StateDir)
+	if err != nil {
+		return fmt.Errorf("fallback cert: %w", err)
+	}
+	logger.Printf("fallback cert at %s (regenerated if absent or expired)", fb.CertPath)
+
 	// Spawn Caddy.
 	bootstrap := os.Getenv("CADDY_BOOTSTRAP")
 	if bootstrap == "" {
@@ -77,9 +90,25 @@ func run(logger *log.Logger) error {
 		return fmt.Errorf("spawn caddy: %w", err)
 	}
 
-	if err := waitForAdmin(cfg.CaddyAdminAddr, 10*time.Second); err != nil {
+	// Single result holder for Caddy's exit. Multiple consumers
+	// (main loop + shutdown) coordinate via caddyDone close + caddyErr
+	// once-published.
+	var (
+		caddyErr  error
+		caddyDone = make(chan struct{})
+	)
+	go func() {
+		caddyErr = proc.Wait()
+		close(caddyDone)
+	}()
+
+	terminateCaddy := func() {
 		_ = proc.Terminate()
-		_ = proc.Wait()
+	}
+
+	if err := waitForAdmin(cfg.CaddyAdminAddr, 10*time.Second); err != nil {
+		terminateCaddy()
+		<-caddyDone
 		return fmt.Errorf("caddy admin never came up at %s: %w", cfg.CaddyAdminAddr, err)
 	}
 	logger.Printf("caddy admin ready at %s", cfg.CaddyAdminAddr)
@@ -102,8 +131,8 @@ func run(logger *log.Logger) error {
 	defer cancelPoller()
 	fetcher, err := poller.NewTsnetFetcher(pollerCtx, cfg)
 	if err != nil {
-		_ = proc.Terminate()
-		_ = proc.Wait()
+		terminateCaddy()
+		<-caddyDone
 		return fmt.Errorf("tsnet fetcher: %w", err)
 	}
 	defer fetcher.Close()
@@ -111,16 +140,19 @@ func run(logger *log.Logger) error {
 	admin := &adminclient.Client{Addr: cfg.CaddyAdminAddr}
 
 	runner, err := poller.Start(pollerCtx, poller.Deps{
-		Config:  cfg,
-		Health:  healthStore,
-		Admin:   admin,
-		Fetcher: fetcher,
+		Config:           cfg,
+		Health:           healthStore,
+		Admin:            admin,
+		Fetcher:          fetcher,
+		FallbackCertPath: fb.CertPath,
+		FallbackKeyPath:  fb.KeyPath,
 	}, logger)
 	if err != nil {
-		_ = proc.Terminate()
-		_ = proc.Wait()
+		terminateCaddy()
+		<-caddyDone
 		return fmt.Errorf("poller: %w", err)
 	}
+	_ = runner // retained for SIGHUP fan-out below
 
 	// DNS sanity check goroutine (SPEC §9.5).
 	dnsCtx, cancelDNS := context.WithCancel(context.Background())
@@ -135,9 +167,13 @@ func run(logger *log.Logger) error {
 		Interval: cfg.PollInterval,
 		OnResult: func(r dnscheck.Result) {
 			healthStore.RecordDNSResult(r)
-			if r.Violation {
+		},
+		OnTransition: func(domain string, violating bool, answers []string, resolver string) {
+			if violating {
 				logger.Printf("dnscheck: PUBLIC DNS LEAK: %s resolves to %v (resolver=%s) — SPEC §3.5 invariant violated",
-					r.Domain, r.Answers, r.Resolver)
+					domain, answers, resolver)
+			} else {
+				logger.Printf("dnscheck: leak cleared for %s (resolver=%s)", domain, resolver)
 			}
 		},
 	}
@@ -152,9 +188,6 @@ func run(logger *log.Logger) error {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
 
-	caddyExit := make(chan error, 1)
-	go func() { caddyExit <- proc.Wait() }()
-
 	var shutdownOnce sync.Once
 	shutdown := func(reason string) {
 		shutdownOnce.Do(func() {
@@ -162,13 +195,13 @@ func run(logger *log.Logger) error {
 			cancelDNS()
 			cancelPoller()
 			cancelStatus()
-			_ = proc.Terminate()
+			terminateCaddy()
 			select {
-			case <-caddyExit:
+			case <-caddyDone:
 			case <-time.After(shutdownGrace):
 				logger.Printf("caddy did not exit within %s; killing", shutdownGrace)
 				_ = proc.Signal(syscall.SIGKILL)
-				<-caddyExit
+				<-caddyDone
 			}
 		})
 	}
@@ -184,9 +217,8 @@ func run(logger *log.Logger) error {
 				shutdown(sig.String())
 				return nil
 			}
-		case err := <-caddyExit:
-			caddyExit <- err
-			if err == nil {
+		case <-caddyDone:
+			if caddyErr == nil {
 				logger.Printf("caddy exited cleanly; orchestrator exiting")
 				cancelDNS()
 				cancelPoller()
@@ -194,7 +226,7 @@ func run(logger *log.Logger) error {
 				return nil
 			}
 			shutdown("caddy exited unexpectedly")
-			return fmt.Errorf("caddy exited: %w", err)
+			return fmt.Errorf("caddy exited: %w", caddyErr)
 		case err := <-statusErrCh:
 			if err != nil {
 				logger.Printf("status server failed: %v", err)

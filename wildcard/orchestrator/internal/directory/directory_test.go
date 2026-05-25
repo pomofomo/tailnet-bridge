@@ -47,8 +47,8 @@ func TestValidate_Cases(t *testing.T) {
 	}{
 		{"wrong version", func(d *Directory) { d.Version = 2 }, "version"},
 		{"empty domain", func(d *Directory) { d.Community.Domain = "" }, "community.domain"},
-		{"domain missing ts", func(d *Directory) { d.Community.Domain = "smith.example.com" }, "ts.<basedomain>"},
-		{"domain not enough labels", func(d *Directory) { d.Community.Domain = "ts.example.com" }, "ts.<basedomain>"},
+		{"domain missing ts", func(d *Directory) { d.Community.Domain = "smith.example.com" }, "4 labels"},
+		{"domain not enough labels", func(d *Directory) { d.Community.Domain = "ts.example.com" }, "4 labels"},
 		{"empty tailnet", func(d *Directory) { d.Community.Tailnet = "" }, "tailnet"},
 		{"non ts.net tailnet", func(d *Directory) { d.Community.Tailnet = "smith.example.com" }, "ts.net"},
 		{"bad service name", func(d *Directory) { d.Services[0].Name = "-bad" }, "name"},

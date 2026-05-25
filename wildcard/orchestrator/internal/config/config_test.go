@@ -167,9 +167,9 @@ func TestLoad_DomainShape(t *testing.T) {
 	t.Setenv("PK", "k")
 	t.Setenv("CK", "ck")
 	cases := []struct {
-		name      string
-		domain    string
-		wantErr   string
+		name    string
+		domain  string
+		wantErr string
 	}{
 		{"missing ts label", "smith.example.com", "ts"},
 		{"three labels", "smith.ts.example", "4 labels"},

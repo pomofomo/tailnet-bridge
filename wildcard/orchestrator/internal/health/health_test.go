@@ -91,9 +91,9 @@ func TestStore_CommunityIDForHost(t *testing.T) {
 	}{
 		{"wiki.smith.ts.example.com", "smith"},
 		{"git.austin.ts.example.com", "austin"},
-		{"smith.ts.example.com", "smith"},                 // apex
-		{"deep.nested.smith.ts.example.com", ""},          // two labels above
-		{"bad.example.com", ""},                            // unknown
+		{"smith.ts.example.com", "smith"},        // apex
+		{"deep.nested.smith.ts.example.com", ""}, // two labels above
+		{"bad.example.com", ""},                  // unknown
 	}
 	for _, tc := range cases {
 		t.Run(tc.host, func(t *testing.T) {

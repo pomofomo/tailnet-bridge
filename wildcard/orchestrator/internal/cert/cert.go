@@ -99,19 +99,32 @@ func Load(certPath, keyPath string) (*Bundle, error) {
 }
 
 // Validate checks the Bundle against an expected community domain and
-// current time (SPEC §9.4).
+// current time (SPEC §9.4) using the system trust store.
+//
+// For tests that need to inject a custom root, call ValidateWithRoots
+// directly.
 //
 // Rules:
-//   - At least one SAN is `*.expectedDomain` (or every label-1 hostname
-//     for the wildcard would be covered).
+//   - At least one SAN equals `*.expectedDomain` (per-service certs are
+//     not supported in v1; SPEC §13).
 //   - NotAfter is strictly in the future; otherwise ErrExpired.
-//   - The cert chain validates against the system trust store (Let's
-//     Encrypt is a public CA so this works).
+//   - The cert chain validates against the supplied root pool (Let's
+//     Encrypt is a public CA, so the system pool works in production).
 //
-// On success, the cert's MinValidity slack is checked; a warning is NOT
-// emitted from this function (the caller decides how to log) — instead
-// the caller can compare Bundle.NotAfter against time.Now()+MinValidity.
+// MinValidity slack is checked by the caller — the poller logs a
+// warning when Bundle.NotAfter is closer than cert.MinValidity.
 func Validate(b *Bundle, expectedDomain string, now time.Time) error {
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		return fmt.Errorf("cert: system trust store: %w", err)
+	}
+	return ValidateWithRoots(b, expectedDomain, pool, now)
+}
+
+// ValidateWithRoots is Validate with an explicit root pool. Exposed so
+// tests can verify chain handling against an in-memory self-signed root
+// without depending on the system trust store.
+func ValidateWithRoots(b *Bundle, expectedDomain string, roots *x509.CertPool, now time.Time) error {
 	if b == nil || b.Leaf == nil {
 		return errors.New("cert: nil bundle")
 	}
@@ -123,23 +136,22 @@ func Validate(b *Bundle, expectedDomain string, now time.Time) error {
 		return fmt.Errorf("cert: not yet valid (not_before=%s)", b.NotBefore.Format(time.RFC3339))
 	}
 
-	// SAN coverage.
+	// SAN coverage. SPEC §13 — per-service certs are out of scope, so
+	// this strictly requires the wildcard SAN.
 	if !sansCover(b.DNSNames, expectedDomain) {
-		return fmt.Errorf("%w: expected wildcard for %q, got SANs %v",
-			ErrNoSAN, expectedDomain, b.DNSNames)
+		return fmt.Errorf("%w: expected wildcard SAN %q (per-service certs not supported, SPEC §13); got SANs %v",
+			ErrNoSAN, "*."+expectedDomain, b.DNSNames)
 	}
 
-	// Chain verification against system trust store.
-	pool, err := x509.SystemCertPool()
-	if err != nil {
-		return fmt.Errorf("cert: system trust store: %w", err)
+	if roots == nil {
+		return errors.New("cert: nil root pool")
 	}
 	inters := x509.NewCertPool()
 	for _, ic := range b.Intermediates {
 		inters.AddCert(ic)
 	}
 	opts := x509.VerifyOptions{
-		Roots:         pool,
+		Roots:         roots,
 		Intermediates: inters,
 		CurrentTime:   now,
 	}

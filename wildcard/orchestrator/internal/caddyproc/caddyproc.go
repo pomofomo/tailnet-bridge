@@ -24,6 +24,9 @@ import (
 // Proc is a running Caddy child.
 type Proc struct {
 	cmd     *exec.Cmd
+	cancel  context.CancelFunc
+	stdout  io.ReadCloser
+	stderr  io.ReadCloser
 	pumpsWG sync.WaitGroup
 }
 
@@ -32,36 +35,57 @@ type Proc struct {
 //	caddy run --config <bootstrap> --resume=false
 //
 // stdout/stderr are line-prefixed with "caddy: " and forwarded to this
-// process's stderr.
+// process's stderr. The pumps shut down when the child's pipes EOF OR
+// when ctx is cancelled — whichever comes first — so a wedged pipe
+// doesn't keep the goroutines alive forever.
 func Start(ctx context.Context, caddyBin, bootstrapPath string) (*Proc, error) {
 	if caddyBin == "" {
 		caddyBin = "caddy"
 	}
+	pumpCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(ctx, caddyBin, "run", "--config", bootstrapPath, "--resume=false")
 	cmd.Env = os.Environ()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("caddyproc: stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("caddyproc: stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		cancel()
 		return nil, fmt.Errorf("caddyproc: start %s: %w", caddyBin, err)
 	}
 
-	p := &Proc{cmd: cmd}
+	p := &Proc{cmd: cmd, cancel: cancel, stdout: stdout, stderr: stderr}
 	p.pumpsWG.Add(2)
-	go p.pump(stdout)
-	go p.pump(stderr)
+	go p.pump(pumpCtx, stdout)
+	go p.pump(pumpCtx, stderr)
 	return p, nil
 }
 
-func (p *Proc) pump(r io.Reader) {
+// pump forwards r line-by-line to stderr with a "caddy: " prefix.
+// Exits on reader EOF or ctx cancellation.
+func (p *Proc) pump(ctx context.Context, r io.ReadCloser) {
 	defer p.pumpsWG.Done()
+	// Close the pipe when ctx is cancelled so the blocking ReadString
+	// returns; without this, a child that never closes its pipes would
+	// keep this goroutine alive forever.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = r.Close()
+		case <-done:
+		}
+	}()
+
 	br := bufio.NewReader(r)
 	for {
 		line, err := br.ReadString('\n')
@@ -80,6 +104,10 @@ func (p *Proc) pump(r io.Reader) {
 // Wait blocks until the child exits and the output pumps drain.
 func (p *Proc) Wait() error {
 	err := p.cmd.Wait()
+	// Ensure pumps stop even if the child somehow left a pipe open.
+	if p.cancel != nil {
+		p.cancel()
+	}
 	p.pumpsWG.Wait()
 	return err
 }

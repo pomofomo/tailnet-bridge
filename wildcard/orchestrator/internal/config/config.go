@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"bridge/internal/dnsutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -96,10 +97,6 @@ type rawCommunity struct {
 
 var (
 	communityIDRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
-	// domain shape: <community>.ts.<basedomain>, e.g. "smith.ts.example.com".
-	// Enforced: at least four labels (community + ts + base + tld), the
-	// second label (zero-indexed: labels[1]) must be literally "ts".
-	domainRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$`)
 )
 
 // Load reads, parses, and validates the YAML config at path.
@@ -261,42 +258,17 @@ func applyDurations(raw *rawConfig, cfg *Config) error {
 	return nil
 }
 
-// validateDomainShape enforces the <community>.ts.<basedomain> form.
-// Specifically: at least 4 labels, lowercase per-label rules, the
-// SECOND label (after the leading community label) must be exactly
-// "ts" (SPEC §3.5 / §3.6 — the `ts.` subdomain is the tailnet-only
-// zone that grounds the cert trust model).
+// validateDomainShape enforces the wildcard-bridge domain shape.
+// Implementation lives in internal/dnsutil so the directory package
+// validates against the same rule (SPEC §3.5 / §3.6).
 func validateDomainShape(domain string) error {
-	d := strings.ToLower(domain)
-	if !domainRE.MatchString(d) {
-		return fmt.Errorf("domain %q is not a valid DNS name", domain)
-	}
-	labels := strings.Split(d, ".")
-	if len(labels) < 4 {
-		return fmt.Errorf("domain %q must be at least 4 labels (e.g. community.ts.base.tld)", domain)
-	}
-	if labels[1] != "ts" {
-		return fmt.Errorf("domain %q: second label must be \"ts\" (SPEC §3.6 — the tailnet-only zone)", domain)
-	}
-	for _, lbl := range labels {
-		if len(lbl) > 63 {
-			return fmt.Errorf("domain %q: label %q exceeds 63 chars", domain, lbl)
-		}
-	}
-	if len(d) > 253 {
-		return fmt.Errorf("domain %q exceeds 253 chars", domain)
-	}
-	return nil
+	return dnsutil.ValidateBridgeDomain(domain)
 }
 
 // baseDomainOf returns everything after the first label of domain.
 // "smith.ts.example.com" → "ts.example.com".
 func baseDomainOf(domain string) string {
-	d := strings.ToLower(domain)
-	if i := strings.IndexByte(d, '.'); i >= 0 {
-		return d[i+1:]
-	}
-	return d
+	return dnsutil.BaseDomain(domain)
 }
 
 // BaseDomain returns the shared `ts.<base>` suffix all communities live

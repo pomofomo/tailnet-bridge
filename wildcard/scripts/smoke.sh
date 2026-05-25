@@ -100,6 +100,26 @@ echo "[smoke] orchestrator + plugin go tests"
 ( cd caddy-plugin/bridgedns   && go test -count=1 ./... >/dev/null )
 echo "  ok: package tests pass"
 
+# ─── caddy bootstrap config sanity (optional) ─────────────────────────────
+# When `caddy` is on PATH, ask it to validate the bootstrap JSON we ship.
+# This catches typos in caddy/bootstrap.json without requiring tsnet or
+# a real upstream.
+
+if command -v caddy >/dev/null 2>&1; then
+  echo "[smoke] caddy validate ./caddy/bootstrap.json"
+  if caddy validate --config ./caddy/bootstrap.json --adapter json >/dev/null 2>caddy_validate.err; then
+    echo "  ok: bootstrap.json passes caddy validate"
+  else
+    echo "  FAIL: caddy validate rejected the bootstrap config:" >&2
+    cat caddy_validate.err >&2 || true
+    rm -f caddy_validate.err
+    exit 1
+  fi
+  rm -f caddy_validate.err
+else
+  echo "[smoke] skipping caddy validate (caddy not on PATH)"
+fi
+
 # ─── scripts/*.sh syntax + dry-run ────────────────────────────────────────
 
 echo "[smoke] scripts/*.sh syntax + --help + --dry-run"

@@ -19,6 +19,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"bridge/internal/dnsutil"
 )
 
 // Directory is the validated JSON document returned by a community.
@@ -53,7 +55,6 @@ type FetchResult struct {
 
 var (
 	serviceNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
-	domainShapeRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$`)
 )
 
 // Fetch GETs url through client, sending If-None-Match: prevETag when
@@ -141,12 +142,8 @@ func Validate(d *Directory, expectedDomain string) error {
 		return fmt.Errorf("community.domain is required")
 	}
 	dom := strings.ToLower(d.Community.Domain)
-	if !domainShapeRE.MatchString(dom) {
-		return fmt.Errorf("community.domain %q is not a valid DNS name", d.Community.Domain)
-	}
-	labels := strings.Split(dom, ".")
-	if len(labels) < 4 || labels[1] != "ts" {
-		return fmt.Errorf("community.domain %q must be <community>.ts.<basedomain> (SPEC §3.6)", d.Community.Domain)
+	if err := dnsutil.ValidateBridgeDomain(dom); err != nil {
+		return fmt.Errorf("community.domain: %w", err)
 	}
 	if expectedDomain != "" && dom != strings.ToLower(expectedDomain) {
 		return fmt.Errorf("community.domain %q does not match local config %q", d.Community.Domain, expectedDomain)
