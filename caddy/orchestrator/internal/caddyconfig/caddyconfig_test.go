@@ -115,6 +115,12 @@ func TestBuild_StructuralShape(t *testing.T) {
 	if smithWiki["auth_key"].(string) != "personal-key" {
 		t.Errorf("listener auth key not personal: %v", smithWiki)
 	}
+	if smithDialer["ephemeral"] != false {
+		t.Errorf("dialer ephemeral must be explicit false: %v", smithDialer)
+	}
+	if smithWiki["ephemeral"] != false {
+		t.Errorf("listener ephemeral must be explicit false: %v", smithWiki)
+	}
 
 	http := apps["http"].(map[string]any)
 	servers := http["servers"].(map[string]any)
@@ -150,6 +156,19 @@ func TestBuild_StructuralShape(t *testing.T) {
 	}
 	if !equalStringSlice(wHandlers, []string{"authentication", "reverse_proxy"}) {
 		t.Errorf("handler order with rewrite_body=false: %v", wHandlers)
+	}
+
+	// Identity headers (SPEC §8.2) must include X-Tailscale-Node.
+	var rpHeaders map[string]any
+	for _, h := range wHandle {
+		if hm := h.(map[string]any); hm["handler"].(string) == "reverse_proxy" {
+			rpHeaders = hm["headers"].(map[string]any)["request"].(map[string]any)["set"].(map[string]any)
+		}
+	}
+	for _, hdr := range []string{"X-Tailscale-User", "X-Tailscale-User-Email", "X-Tailscale-User-Name", "X-Tailscale-Node", "X-Tailscale-Tailnet"} {
+		if _, ok := rpHeaders[hdr]; !ok {
+			t.Errorf("missing identity header %q in request.set: %v", hdr, rpHeaders)
+		}
 	}
 
 	// handle_errors → /__bridge_error → status server.

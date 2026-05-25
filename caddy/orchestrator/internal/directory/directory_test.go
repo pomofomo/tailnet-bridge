@@ -51,6 +51,10 @@ func TestValidate_Cases(t *testing.T) {
 			d.Services[0].RewriteBody = true
 			d.Services[0].RewriteExtraHosts = []string{"static.example.com"}
 		}, "subdomain"},
+		{"rewrite extra outside tailnet (rewrite_body=false)", func(d *Directory) {
+			d.Services[0].RewriteBody = false
+			d.Services[0].RewriteExtraHosts = []string{"static.example.com"}
+		}, "subdomain"},
 		{"label too long", func(d *Directory) {
 			d.Community.Prefix = strings.Repeat("a", 30) + "-"
 			d.Services[0].Name = strings.Repeat("b", 40)

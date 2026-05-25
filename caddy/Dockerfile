@@ -7,7 +7,7 @@ RUN xcaddy build \
     --with github.com/caddyserver/replace-response
 
 # ─── Stage 2: build the orchestrator ──────────────────────────────────────
-FROM golang:1.22-bookworm AS orchestrator-builder
+FROM golang:1.23-bookworm AS orchestrator-builder
 WORKDIR /src
 # Cache modules first.
 COPY orchestrator/go.mod orchestrator/go.sum* ./

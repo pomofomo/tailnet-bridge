@@ -140,9 +140,6 @@ func Validate(d *Directory) error {
 	if !prefixRE.MatchString(d.Community.Prefix) {
 		return fmt.Errorf("community.prefix %q must match [a-z0-9]+-", d.Community.Prefix)
 	}
-
-
-
 	seenNames := make(map[string]struct{}, len(d.Services))
 	for i, s := range d.Services {
 		ctx := fmt.Sprintf("services[%d]", i)
@@ -174,14 +171,14 @@ func Validate(d *Directory) error {
 			return fmt.Errorf("%s.upstream_host %q is not a subdomain of community.tailnet %q",
 				ctx, s.UpstreamHost, d.Community.Tailnet)
 		}
-
-
-		if s.RewriteBody {
-			for j, h := range s.RewriteExtraHosts {
-				if !isSubdomainOf(h, d.Community.Tailnet) {
-					return fmt.Errorf("%s.rewrite_extra_hosts[%d] %q is not a subdomain of community.tailnet %q",
-						ctx, j, h, d.Community.Tailnet)
-				}
+		// rewrite_extra_hosts entries MUST be subdomains of community.tailnet
+		// regardless of rewrite_body — the data validity is independent of
+		// the runtime flag, so a directory that publishes invalid entries is
+		// rejected even when they are currently ignored. (SPEC §6.2.)
+		for j, h := range s.RewriteExtraHosts {
+			if !isSubdomainOf(h, d.Community.Tailnet) {
+				return fmt.Errorf("%s.rewrite_extra_hosts[%d] %q is not a subdomain of community.tailnet %q",
+					ctx, j, h, d.Community.Tailnet)
 			}
 		}
 	}

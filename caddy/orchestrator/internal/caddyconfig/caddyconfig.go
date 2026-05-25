@@ -68,6 +68,7 @@ func Build(in Input) ([]byte, error) {
 			"auth_key":  authByID[cid],
 			"hostname":  cfg.Personal.BridgeHostname,
 			"state_dir": filepath.Join(cfg.StateDir, dialerName),
+			"ephemeral": false,
 		}
 
 		svcs := make([]directory.Service, len(dir.Services))
@@ -88,6 +89,7 @@ func Build(in Input) ([]byte, error) {
 				"auth_key":  cfg.Personal.AuthKey,
 				"hostname":  personalHost,
 				"state_dir": filepath.Join(cfg.StateDir, nodeName),
+				"ephemeral": false,
 			}
 
 			servers[nodeName] = buildServer(cfg, cid, dir, svc, nodeName, dialerName)
@@ -130,6 +132,7 @@ func buildServer(cfg *config.Config, cid string, dir *directory.Directory, svc d
 		"X-Tailscale-User":       {"{http.auth.user.tailscale_login}"},
 		"X-Tailscale-User-Email": {"{http.auth.user.tailscale_user}"},
 		"X-Tailscale-User-Name":  {"{http.auth.user.tailscale_name}"},
+		"X-Tailscale-Node":       {"{http.auth.user.tailscale_node}"},
 		"X-Tailscale-Tailnet":    {"{http.auth.user.tailscale_tailnet}"},
 		// Forwarding.
 		"Host":              {"{http.reverse_proxy.upstream.hostport}"},
