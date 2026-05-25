@@ -1,0 +1,40 @@
+# Tailnet Community Bridge — example configuration.
+# Copy to config.yml and edit. See SPEC.md §7 for the full schema.
+
+personal:
+  # Reference to the personal tailnet auth key. One of: auth_key_env,
+  # auth_key_file, auth_key (direct, discouraged).
+  auth_key_env: PERSONAL_TAILNET_AUTHKEY
+
+  # Optional. Hostname used by the bridge's community-side dialer nodes
+  # (visible to community admins as "<this>-bridge" or similar; see SPEC
+  # §8.1). If omitted, the container hostname is used.
+  bridge_hostname: alice-bridge
+
+# Communities this user belongs to. Zero or more entries.
+communities:
+  - id: smithfamily                  # local identifier; must be unique
+    directory_url: https://directory.smithfamily.ts.net/services
+    auth_key_env: SMITHFAMILY_AUTHKEY
+
+  # - id: austinmakers
+  #   directory_url: https://services.austinmakers.ts.net/directory
+  #   auth_key_env: AUSTINMAKERS_AUTHKEY
+
+# How often to re-poll every community directory. Default 5m.
+poll_interval: 5m
+
+# How long to wait for a community tsnet node to come online before
+# considering it failed. Default 60s.
+community_join_timeout: 60s
+
+# State directory. tsnet node state persists here so the bridge keeps the
+# same node identity across restarts. Must be a writable volume.
+state_dir: /var/lib/bridge
+
+# Caddy admin endpoint. Default is fine inside the container.
+caddy_admin_addr: 127.0.0.1:2019
+
+# Local port for the orchestrator's error page + status server.
+# Caddy's handle_errors reverse-proxies to this port. Default 8081.
+orchestrator_error_port: 8081

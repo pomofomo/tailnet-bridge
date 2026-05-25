@@ -1,0 +1,32 @@
+# Reference deployment of a single user's bridge.
+# See SPEC.md §11 and config.example.yml.
+
+services:
+  bridge:
+    build:
+      context: .
+    image: tailnet-bridge:local
+    container_name: tailnet-bridge
+    restart: unless-stopped
+
+    # Auth keys are injected via env. Either:
+    #   - export them in your shell before `docker compose up`, or
+    #   - put them in a .env file alongside this compose file.
+    # The names here must match the auth_key_env values in config.yml.
+    environment:
+      PERSONAL_TAILNET_AUTHKEY: ${PERSONAL_TAILNET_AUTHKEY:?set in .env}
+      SMITHFAMILY_AUTHKEY: ${SMITHFAMILY_AUTHKEY:-}
+      # AUSTINMAKERS_AUTHKEY: ${AUSTINMAKERS_AUTHKEY:-}
+
+    volumes:
+      - ./config.yml:/etc/bridge/config.yml:ro
+      - bridge-state:/var/lib/bridge
+
+    # No ports are published. All traffic flows through tsnet.
+    # The orchestrator status server and Caddy admin API are container-local.
+
+    # SIGHUP triggers an immediate re-poll of every community directory:
+    #   docker compose kill -s HUP bridge
+
+volumes:
+  bridge-state:

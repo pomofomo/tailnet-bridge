@@ -1,0 +1,23 @@
+# Build outputs
+/bin/
+/dist/
+/out/
+
+# State volume (when bind-mounted locally for testing)
+/var/
+/state/
+
+# Local config with real secrets
+/config.yml
+/.env
+
+# Go
+*.test
+*.out
+coverage.out
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
