@@ -1,9 +1,12 @@
 # Tailnet Community Bridge — wildcard-domain variant Makefile.
 #
-# Native targets operate on the Go orchestrator under ./orchestrator.
+# Native targets operate on:
+#   - the Go orchestrator under ./orchestrator
+#   - the custom Caddy plugin under ./caddy-plugin/bridgedns
 # Container targets drive docker compose at this directory.
 
 ORCHESTRATOR_DIR := orchestrator
+PLUGIN_DIR       := caddy-plugin/bridgedns
 BIN_DIR          := bin
 ORCHESTRATOR_BIN := $(BIN_DIR)/orchestrator
 
@@ -32,24 +35,48 @@ $(ORCHESTRATOR_BIN): $(shell find $(ORCHESTRATOR_DIR) -name '*.go' 2>/dev/null) 
 	cd $(ORCHESTRATOR_DIR) && $(GO) build $(GOFLAGS) -ldflags='$(LDFLAGS)' -o ../$(ORCHESTRATOR_BIN) ./cmd/orchestrator
 
 .PHONY: test
-test: ## Run unit tests for the orchestrator.
+test: ## Run unit tests for orchestrator + plugin.
 	cd $(ORCHESTRATOR_DIR) && $(GO) test ./...
+	cd $(PLUGIN_DIR)       && $(GO) test ./...
 
 .PHONY: test-race
 test-race: ## Run unit tests with the race detector.
 	cd $(ORCHESTRATOR_DIR) && $(GO) test -race ./...
+	cd $(PLUGIN_DIR)       && $(GO) test -race ./...
 
 .PHONY: vet
-vet: ## Run go vet across the orchestrator.
+vet: ## go vet across orchestrator + plugin.
 	cd $(ORCHESTRATOR_DIR) && $(GO) vet ./...
+	cd $(PLUGIN_DIR)       && $(GO) vet ./...
 
 .PHONY: tidy
-tidy: ## Run go mod tidy.
+tidy: ## go mod tidy in both modules.
 	cd $(ORCHESTRATOR_DIR) && $(GO) mod tidy
+	cd $(PLUGIN_DIR)       && $(GO) mod tidy
+
+.PHONY: check
+check: vet test ## Build + vet + unit tests. Run before commits.
+	cd $(ORCHESTRATOR_DIR) && $(GO) build ./...
+	cd $(PLUGIN_DIR)       && $(GO) build ./...
 
 .PHONY: clean
 clean: ## Remove build artifacts.
 	rm -rf $(BIN_DIR)
+
+# ─── Smoke ────────────────────────────────────────────────────────────────
+#
+# `make smoke` exercises the orchestrator's startup path against a fake
+# Caddy admin endpoint and a fake directory server. Useful as the first
+# sanity check before a real docker deploy. See SMOKE.md for details
+# on what gets exercised.
+#
+# Without auth keys or a real tailnet, the orchestrator's lifecycle stops
+# at the "bring up tsnet poller node" step, but config parsing, cert
+# loading, status server, dnscheck, and admin/load wiring all run.
+
+.PHONY: smoke
+smoke: build ## Local lifecycle smoke test (no tailnets).
+	@./scripts/smoke.sh
 
 # ─── Docker ───────────────────────────────────────────────────────────────
 

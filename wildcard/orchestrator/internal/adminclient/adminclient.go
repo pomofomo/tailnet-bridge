@@ -1,42 +1,59 @@
-// Package adminclient POSTs configurations to Caddy's admin API.
-// See https://caddyserver.com/docs/api.
+// Package adminclient is a thin client for Caddy's admin API.
 //
-// Status: STUB.
+// We only need /load. Validation errors are returned verbatim so callers
+// can surface them; we never retry rapidly on a 4xx (SPEC §9.4).
 package adminclient
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
 )
 
-// Client is the minimal surface the rest of the orchestrator depends on.
-// Defined as an interface so tests can substitute a fake.
-type Client interface {
-	// Load POSTs the provided JSON config to <addr>/load. On a non-2xx
-	// response, returns an error containing Caddy's response body
-	// verbatim (Caddy's error messages are useful — don't swallow them).
-	Load(ctx context.Context, jsonConfig []byte) error
-}
-
-// HTTP is the production Client backed by net/http. Addr is the
-// host:port the Caddy admin API listens on (default 127.0.0.1:2019).
-type HTTP struct {
+// Client targets a single Caddy admin endpoint.
+type Client struct {
+	// Addr is the host:port of the admin endpoint (e.g. "127.0.0.1:2019").
 	Addr string
+	// HTTP overrides the underlying client; nil means a sensible default.
+	HTTP *http.Client
 }
 
-// New returns an HTTP client bound to the given admin address.
-func New(addr string) *HTTP { return &HTTP{Addr: addr} }
+// Load POSTs jsonConfig to http://<addr>/load.
+//
+// On non-2xx the response body (Caddy's validation message) is returned
+// verbatim wrapped in an error.
+func (c *Client) Load(ctx context.Context, jsonConfig []byte) error {
+	if c.Addr == "" {
+		return fmt.Errorf("adminclient: empty Addr")
+	}
+	url := "http://" + c.Addr + "/load"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonConfig))
+	if err != nil {
+		return fmt.Errorf("adminclient: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-// Load implements Client.
-func (h *HTTP) Load(ctx context.Context, jsonConfig []byte) error {
-	// TODO(impl):
-	//   1. http.NewRequestWithContext(ctx, "POST",
-	//      "http://"+h.Addr+"/load", bytes.NewReader(jsonConfig)).
-	//   2. Content-Type: application/json.
-	//   3. Use a short timeout (e.g. 30s) on the HTTP client.
-	//   4. On non-2xx, read the body and wrap it into an error.
-	_, _ = ctx, jsonConfig
-	return errNotImplemented
+	client := c.HTTP
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("adminclient: POST %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Drain so the connection can be reused.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+	return fmt.Errorf("adminclient: POST %s: status %d: %s",
+		url, resp.StatusCode, strings.TrimSpace(string(body)))
 }
-
-var errNotImplemented = errors.New("adminclient: not yet implemented")

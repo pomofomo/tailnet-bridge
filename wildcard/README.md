@@ -21,11 +21,21 @@ trades fewer admin requirements for some compatibility caveats; the
 
 ## Current status
 
-**Skeleton only.** The package layout, configuration shape, build
-plumbing, and operator scripts are in place. The Go orchestrator
-compiles but does not yet do real work — every package contains stub
-functions that return `errNotImplemented`. Follow [SPEC.md](./SPEC.md) to
-fill them in.
+**Implemented.** The orchestrator builds, the Caddy `bridgedns` plugin
+builds, the unit tests pass, and `make smoke` exercises the startup
+lifecycle locally. The package framework follows SPEC.md end-to-end.
+
+What's NOT covered by `make smoke` (because they need real
+infrastructure):
+
+- Coming up on real personal/community tailnets via tsnet.
+- Terminating TLS with a real public-CA wildcard cert.
+- The SIGHUP signal path through Docker.
+- The personal-tailnet Split DNS routing.
+
+See ["Verify locally"](#verify-locally) below for the safe checks you
+can run on any machine, and ["Setup walkthrough"](#setup-walkthrough-member-side)
+for the real-deploy path.
 
 ---
 
@@ -158,6 +168,49 @@ the bridge runs as.
 
 The bridge persists tsnet state under `/var/lib/bridge` so that on
 restarts, nodes resume with the same identity and don't need to re-auth.
+
+## Verify locally
+
+Before touching real tailnets or certs, you can verify the build is
+sane on any machine:
+
+```sh
+make check          # go vet + go build + go test on orchestrator and plugin
+make test-race      # same tests, with the race detector
+make smoke          # binary-level lifecycle smoke test (no tailnets)
+```
+
+Tests cover:
+
+- `internal/config`: YAML parsing, defaults, domain-shape rules, mixed
+  base-domain rejection, auth-key resolution.
+- `internal/directory`: SPEC §8.2 schema validation; ETag-based 304
+  handling; rejection of unknown fields.
+- `internal/cert`: PEM load (RSA + ECDSA), key-cert match check,
+  expiry / SAN coverage, the rotation watcher.
+- `internal/caddyconfig`: deterministic JSON output; per-community
+  one-listener structure; SNI override on the transport; cert
+  load_files; bridgedns app entries; collision behavior.
+- `internal/health`: per-community snapshot store; domain-based
+  hostname attribution; DNS-leak tracking.
+- `internal/poller`: per-community fetch loop, cert-watcher reload,
+  apply-on-change hash dedupe, "preserve prior directory on error".
+- `internal/dnscheck`: NXDOMAIN ≠ violation, positive answer ⇒
+  violation, multi-domain fan-out.
+- `internal/status`: `/__bridge_error` rendering for known / unknown
+  communities, cert-expiry diagnosis, DNS-leak warning surface.
+- `caddy-plugin/bridgedns`: A/AAAA answers, apex NXDOMAIN, out-of-zone
+  REFUSED, case-insensitive matching, IPv4/IPv6 split.
+
+`make smoke` additionally exercises:
+
+- A real `bin/orchestrator` startup with `BRIDGE_CONFIG` set, verifying
+  it parses the config and reaches the "wait for Caddy admin" step
+  with a clear error (rather than panicking or silently exiting).
+- `scripts/*.sh` syntax, `--help`, and `--dry-run` modes.
+
+If any of these fail, the deploy WILL fail. They're cheap; run them
+after every config change.
 
 ## Setup walkthrough (member side)
 
@@ -527,10 +580,14 @@ comparison.
 ├── Makefile                 build / test / docker shortcuts
 ├── caddy/
 │   └── bootstrap.json       minimal Caddy config (admin API only)
+├── caddy-plugin/
+│   └── bridgedns/           Caddy app plugin: UDP/53 DNS responder bound to
+│                            the same tsnet node Caddy uses for HTTPS
 ├── scripts/
 │   ├── issue-community-cert.sh     (admin) issue a wildcard cert via lego
 │   ├── setup-community-dns.sh      (admin) configure community split DNS
-│   └── setup-personal-split-dns.sh (member) configure personal split DNS
+│   ├── setup-personal-split-dns.sh (member) configure personal split DNS
+│   └── smoke.sh                    local lifecycle smoke test (no tailnets)
 └── orchestrator/            Go source for the orchestrator binary
     ├── cmd/orchestrator/    process entry
     └── internal/
@@ -541,7 +598,6 @@ comparison.
         ├── poller/          polling + cert-watch loop
         ├── caddyproc/       Caddy subprocess management
         ├── adminclient/     POSTs to Caddy's admin API
-        ├── dns/             UDP/53 responder for personal split DNS
         ├── dnscheck/        public-DNS sanity goroutine
         ├── status/          /__bridge_error and /__bridge_status server
         └── health/          per-community health tracking
@@ -551,9 +607,11 @@ comparison.
 
 ```sh
 make build       # build the orchestrator binary into ./bin (no docker)
-make test        # go test ./...
-make test-race   # go test -race ./...
-make vet         # go vet ./...
+make test        # go test for orchestrator + plugin
+make test-race   # tests with race detector
+make vet         # go vet across both modules
+make check       # vet + build + test (run before commits)
+make smoke       # binary-level lifecycle smoke (no tailnets)
 make image       # docker compose build
 make up          # docker compose up -d --build
 make down        # docker compose down (state volume preserved)

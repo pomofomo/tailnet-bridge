@@ -61,10 +61,16 @@ outside the container — all networking flows through tsnet.
 ├── Makefile                 build / test / docker shortcuts
 ├── caddy/
 │   └── bootstrap.json       minimal Caddy config (admin API only)
+├── caddy-plugin/
+│   └── bridgedns/           Caddy app plugin: shares the tsnet node that
+│                            Caddy uses for HTTPS, binds UDP/53 on it for
+│                            the personal-tailnet Split DNS responder
+│                            (SPEC §7.3, §10.1)
 ├── scripts/                 operator and member conveniences (bash)
 │   ├── issue-community-cert.sh
 │   ├── setup-community-dns.sh
-│   └── setup-personal-split-dns.sh
+│   ├── setup-personal-split-dns.sh
+│   └── smoke.sh             local lifecycle smoke (no tailnets)
 └── orchestrator/
     ├── go.mod
     ├── cmd/orchestrator/
@@ -77,7 +83,6 @@ outside the container — all networking flows through tsnet.
         ├── poller/          per-community polling loop, SIGHUP fan-out
         ├── caddyproc/       Caddy child-process lifecycle
         ├── adminclient/     POSTs config to Caddy's admin API
-        ├── dns/             embedded UDP/53 responder (SPEC §7.3, §10.1)
         ├── dnscheck/        public-DNS sanity check goroutine (SPEC §9.5)
         ├── status/          /__bridge_error and /__bridge_status server
         └── health/          per-community health tracking (incl. cert expiry)
@@ -244,8 +249,13 @@ bridge-to-bridge federation, web admin UI.
 
 ## Status
 
-This tree currently contains **stubs only**. The package layout,
-contracts, and `scripts/` skeleton are in place. Implementations are
-intentionally TODO so the spec can be reviewed against a concrete
-shape before code is written. Every Go file compiles; every script
-runs `--help` and `--dry-run`; no real bridging happens yet.
+This tree is **implemented**. `make check` builds both Go modules, runs
+`go vet`, and passes the unit-test suite covering config, directory,
+cert, caddyconfig, poller, dnscheck, health, status, and the bridgedns
+plugin. `make smoke` runs the orchestrator binary against a fake
+admin-port (no real tailnets) and exercises all three operator scripts'
+`--help` and `--dry-run` modes.
+
+What's NOT covered by local checks (and so must be tested in a real
+deploy): tsnet node bring-up, public-CA cert chain verification, the
+SIGHUP path through Docker, Tailscale Split DNS routing.

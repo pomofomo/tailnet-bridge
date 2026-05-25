@@ -1,19 +1,20 @@
-// Package poller owns the bridge's steady-state event loop:
+// Package poller drives the bridge's steady-state event loop (SPEC §10.3).
 //
-//   - per-community goroutines that re-fetch the directory every
-//     poll_interval,
-//   - a cert.Watcher reacting to file rotations on cert_check_interval,
-//   - a SIGHUP fan-out that triggers immediate re-poll + re-stat,
-//   - a single config-regen path serialized by a mutex so that
-//     concurrent triggers coalesce into one POST to Caddy.
-//
-// Status: STUB.
+//   - Per-community goroutines re-fetch directories every poll_interval.
+//   - One cert.Watcher goroutine reloads certs on file changes.
+//   - A single regenerator mutex serializes
+//     (read directories+certs) → (caddyconfig.Build) → (admin /load).
+//   - SIGHUP fans out to every per-community goroutine AND triggers an
+//     immediate cert re-check.
 package poller
 
 import (
 	"context"
-	"errors"
-	"net/http"
+	"crypto/sha256"
+	"fmt"
+	"log"
+	"sync"
+	"time"
 
 	"bridge/internal/adminclient"
 	"bridge/internal/caddyconfig"
@@ -23,95 +24,402 @@ import (
 	"bridge/internal/health"
 )
 
-// Deps bundles the dependencies the poller needs. Each field is an
-// interface or a concrete value so tests can substitute fakes.
+// Fetcher abstracts directory I/O. The production implementation lives
+// in tsnetfetcher.go; tests substitute a fake.
+type Fetcher interface {
+	Fetch(ctx context.Context, communityID, url, prevETag, expectedDomain string) (*directory.FetchResult, error)
+	Ready(communityID string) (bool, error)
+	Close() error
+}
+
+// Applier is the side-effect target for a regen: it receives the
+// freshly-built Caddy JSON. Production wiring sends to adminclient.Client.
+type Applier interface {
+	Apply(ctx context.Context, jsonConfig []byte) error
+}
+
+// adminApplier adapts *adminclient.Client to Applier.
+type adminApplier struct{ c *adminclient.Client }
+
+func (a adminApplier) Apply(ctx context.Context, j []byte) error { return a.c.Load(ctx, j) }
+
+// CertLoader is the cert-reload entry point. Tests substitute a fake.
+type CertLoader interface {
+	Load(certPath, keyPath string) (*cert.Bundle, error)
+}
+
+type defaultCertLoader struct{}
+
+func (defaultCertLoader) Load(c, k string) (*cert.Bundle, error) { return cert.Load(c, k) }
+
+// Deps bundles the dependency injection points.
 type Deps struct {
-	Cfg    *config.Config
-	Health *health.Tracker
+	Config  *config.Config
+	Health  *health.Store
+	Admin   *adminclient.Client
+	Fetcher Fetcher
 
-	// CommunityClient returns an HTTP client wired to dial via the
-	// community-specific ephemeral tsnet node. The poller calls this
-	// every time it polls (so the tsnet node can be torn down between
-	// polls if desired) or once at startup (caller's choice).
-	CommunityClient func(ctx context.Context, c config.Community) (*http.Client, error)
-
-	// LoadCert resolves a community's PEM files into a cert.Bundle and
-	// validates them. Wrapping cert.Load + cert.Validate lets tests
-	// inject synthetic bundles.
-	LoadCert func(c config.Community) (*cert.Bundle, error)
-
-	// Admin is the live Caddy admin client used to POST regenerated config.
-	Admin adminclient.Client
-
-	// BuildConfig wraps caddyconfig.Build. Tests can substitute it.
-	BuildConfig func(caddyconfig.Inputs) ([]byte, error)
+	// Optional overrides; nil means defaults.
+	Build      func(caddyconfig.Input) ([]byte, error)
+	CertLoader CertLoader
+	CertVerify func(*cert.Bundle, string, time.Time) error
 }
 
-// Run blocks until ctx is done. It owns:
-//   - one goroutine per community polling its directory,
-//   - one cert.Watcher goroutine,
-//   - one SIGHUP handler (the caller wires os/signal),
-//   - one merger goroutine that, on any change, regenerates the Caddy
-//     config and POSTs it.
+// Runner is the live polling loop. Construct via Start.
+type Runner struct {
+	deps   Deps
+	apply  Applier
+	build  func(caddyconfig.Input) ([]byte, error)
+	loadc  CertLoader
+	verify func(*cert.Bundle, string, time.Time) error
+
+	// Cert bundles, keyed by community ID, protected by certsMu.
+	certsMu sync.RWMutex
+	certs   map[string]*cert.Bundle
+
+	regenMu  sync.Mutex
+	lastHash [32]byte
+	haveHash bool
+
+	triggers      map[string]chan struct{} // per-community fan-out
+	certTriggerCh chan struct{}            // cert-watcher kick
+
+	logger *log.Logger
+}
+
+// Start spawns one goroutine per community plus the cert watcher and
+// returns a Runner whose TriggerAll method the signal handler can call
+// on SIGHUP.
 //
-// On every successful poll/cert reload, the merger:
-//  1. Builds caddyconfig.Inputs from the latest snapshots.
-//  2. Computes sha256(jsonOut). If unchanged, no POST.
-//  3. Otherwise, adminclient.Load(ctx, addr, jsonOut). On non-2xx,
-//     keeps the previous config live, records the error in health,
-//     and surfaces it on /__bridge_status.
-//
-// On SIGHUP (delivered via Trigger), the poller does an immediate
-// fan-out: every community gets re-polled, every cert pair gets
-// re-stat-and-loaded, then a single merger pass runs.
-func Run(ctx context.Context, d Deps) error {
-	// TODO(impl): see the doc comment.
-	_ = d
-	<-ctx.Done()
-	return ctx.Err()
+// Start blocks until each community's first poll has completed (or
+// failed) and the initial cert bundles are loaded, so the first regen
+// has data to work with.
+func Start(ctx context.Context, deps Deps, logger *log.Logger) (*Runner, error) {
+	if deps.Config == nil || deps.Health == nil || deps.Admin == nil || deps.Fetcher == nil {
+		return nil, fmt.Errorf("poller: incomplete deps")
+	}
+	if logger == nil {
+		logger = log.Default()
+	}
+	build := deps.Build
+	if build == nil {
+		build = caddyconfig.Build
+	}
+	loadc := deps.CertLoader
+	if loadc == nil {
+		loadc = defaultCertLoader{}
+	}
+	verify := deps.CertVerify
+	if verify == nil {
+		verify = cert.Validate
+	}
+	r := &Runner{
+		deps:          deps,
+		apply:         adminApplier{c: deps.Admin},
+		build:         build,
+		loadc:         loadc,
+		verify:        verify,
+		certs:         make(map[string]*cert.Bundle, len(deps.Config.Communities)),
+		triggers:      make(map[string]chan struct{}, len(deps.Config.Communities)),
+		certTriggerCh: make(chan struct{}, 1),
+		logger:        logger,
+	}
+
+	// Pre-load certs synchronously; record cert errors in Health.
+	r.reloadAllCerts()
+
+	// Register community domains so dnscheck and status can attribute.
+	for _, c := range deps.Config.Communities {
+		deps.Health.SetDomain(c.ID, c.Domain)
+	}
+
+	// Spawn per-community poll goroutines.
+	for _, c := range deps.Config.Communities {
+		c := c
+		trig := make(chan struct{}, 1)
+		r.triggers[c.ID] = trig
+		go r.runCommunity(ctx, c, trig)
+	}
+
+	// Spawn the cert-watch goroutine.
+	go r.runCertWatcher(ctx)
+
+	// Wait for first-poll watermark on every community (or timeout).
+	r.waitFirstPoll(ctx, deps.Config.CommunityJoinTimeout+5*time.Second)
+
+	// Initial regen even if some communities errored — Caddy still
+	// gets a starting config covering the healthy ones.
+	if err := r.regenerate(ctx); err != nil {
+		logger.Printf("poller: initial regenerate: %v", err)
+	}
+
+	return r, nil
 }
 
-// Trigger asks the running poller to do an immediate full re-poll.
-// Safe to call from a signal handler. A no-op if the poller isn't
-// running.
-func (h *Handle) Trigger() {
-	// TODO(impl): non-blocking send to an internal channel.
+// TriggerAll wakes every per-community goroutine AND fires an immediate
+// cert reload. Non-blocking; coalesces redundant signals.
+func (r *Runner) TriggerAll() {
+	for _, ch := range r.triggers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	select {
+	case r.certTriggerCh <- struct{}{}:
+	default:
+	}
 }
 
-// Handle is returned by Start so callers can Trigger() without exposing
-// internals. The Handle is valid for the lifetime of the Run goroutine.
-type Handle struct {
-	trigger chan struct{}
+func (r *Runner) waitFirstPoll(ctx context.Context, max time.Duration) {
+	deadline := time.NewTimer(max)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		all := r.deps.Health.All()
+		complete := true
+		for _, c := range r.deps.Config.Communities {
+			snap, ok := all[c.ID]
+			if !ok {
+				complete = false
+				break
+			}
+			if snap.CurrentDirectory == nil && snap.LastError == "" {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-tick.C:
+		}
+	}
 }
 
-// Start runs the poller on a fresh goroutine and returns a Handle for
-// signalling. Equivalent to Run but doesn't block.
-func Start(ctx context.Context, d Deps) (*Handle, <-chan error) {
-	errCh := make(chan error, 1)
-	h := &Handle{trigger: make(chan struct{}, 1)}
-	go func() {
-		errCh <- Run(ctx, d)
-	}()
-	// TODO(impl): wire the channel into Run so Trigger has effect.
-	return h, errCh
+// runCommunity is the long-lived polling goroutine for one community.
+func (r *Runner) runCommunity(ctx context.Context, c config.Community, trig <-chan struct{}) {
+	// First poll on startup.
+	r.pollOnce(ctx, c)
+
+	tick := time.NewTicker(r.deps.Config.PollInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			r.pollOnce(ctx, c)
+		case <-trig:
+			r.pollOnce(ctx, c)
+		}
+	}
 }
 
-// FetchOnce is exported for tests and one-shot diagnostic tools. It runs
-// the full poll-and-merge cycle exactly once and returns the resulting
-// JSON config (without POSTing). Wraps directory.Fetch, cert.Load+Validate,
-// caddyconfig.Build.
-func FetchOnce(ctx context.Context, d Deps) ([]byte, error) {
-	// TODO(impl):
-	//   for each community in d.Cfg.Communities:
-	//     - client, err := d.CommunityClient(ctx, c)
-	//     - dir, etag, status, err := directory.Fetch(...)
-	//     - bundle, err := d.LoadCert(c)
-	//     - record into d.Health
-	//   inputs := caddyconfig.Inputs{...}
-	//   return d.BuildConfig(inputs)
-	_, _ = ctx, d
-	_ = directory.Directory{} // keep import live during stub phase
-	return nil, errNotImplemented
+func (r *Runner) pollOnce(ctx context.Context, c config.Community) {
+	prev, _ := r.deps.Health.Get(c.ID)
+	res, err := r.deps.Fetcher.Fetch(ctx, c.ID, c.DirectoryURL, prev.ETag, c.Domain)
+	if err != nil {
+		r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+			s.LastError = err.Error()
+			s.LastPollAttempt = time.Now()
+			return s
+		})
+		r.logger.Printf("poller[%s]: fetch failed: %v", c.ID, err)
+		return
+	}
+
+	if res.NotModified {
+		r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+			s.LastSuccessfulPoll = time.Now()
+			s.LastPollAttempt = time.Now()
+			s.LastError = ""
+			s.ETag = res.ETag
+			return s
+		})
+		return
+	}
+
+	r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+		s.CurrentDirectory = res.Directory
+		s.LastSuccessfulPoll = time.Now()
+		s.LastPollAttempt = time.Now()
+		s.LastError = ""
+		s.ETag = res.ETag
+		return s
+	})
+
+	if err := r.regenerate(ctx); err != nil {
+		r.logger.Printf("poller[%s]: regenerate after poll: %v", c.ID, err)
+	}
 }
 
-var errNotImplemented = errors.New("poller: not yet implemented")
+// runCertWatcher polls every cert_check_interval AND on r.certTriggerCh.
+func (r *Runner) runCertWatcher(ctx context.Context) {
+	tick := time.NewTicker(r.deps.Config.CertCheckInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		case <-r.certTriggerCh:
+		}
+		if r.checkCerts(ctx) {
+			if err := r.regenerate(ctx); err != nil {
+				r.logger.Printf("poller: regenerate after cert reload: %v", err)
+			}
+		}
+	}
+}
+
+// reloadAllCerts loads every (cert,key) pair synchronously. Failures are
+// recorded in Health but don't abort startup. Returns whether any cert
+// loaded successfully (the caller may use this to decide if a regen is
+// worth attempting).
+func (r *Runner) reloadAllCerts() (anyLoaded bool) {
+	for _, c := range r.deps.Config.Communities {
+		b, err := r.loadc.Load(c.CertPath, c.KeyPath)
+		if err != nil {
+			r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+				s.CertError = err.Error()
+				return s
+			})
+			r.logger.Printf("poller[%s]: cert load: %v", c.ID, err)
+			continue
+		}
+		now := time.Now()
+		if vErr := r.verify(b, c.Domain, now); vErr != nil {
+			r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+				s.CertError = vErr.Error()
+				s.CertNotBefore = b.NotBefore
+				s.CertNotAfter = b.NotAfter
+				return s
+			})
+			r.logger.Printf("poller[%s]: cert validate: %v", c.ID, vErr)
+			continue
+		}
+		r.certsMu.Lock()
+		r.certs[c.ID] = b
+		r.certsMu.Unlock()
+		r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+			s.CertError = ""
+			s.CertNotBefore = b.NotBefore
+			s.CertNotAfter = b.NotAfter
+			s.CertLastReload = now
+			return s
+		})
+		anyLoaded = true
+	}
+	return anyLoaded
+}
+
+// checkCerts re-loads every cert; returns true if anything changed.
+func (r *Runner) checkCerts(ctx context.Context) (changed bool) {
+	for _, c := range r.deps.Config.Communities {
+		select {
+		case <-ctx.Done():
+			return changed
+		default:
+		}
+		b, err := r.loadc.Load(c.CertPath, c.KeyPath)
+		if err != nil {
+			r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+				s.CertError = err.Error()
+				return s
+			})
+			// Drop a previously-good cert if the file is now unreadable.
+			r.certsMu.Lock()
+			prev := r.certs[c.ID]
+			delete(r.certs, c.ID)
+			r.certsMu.Unlock()
+			if prev != nil {
+				changed = true
+			}
+			continue
+		}
+		now := time.Now()
+		if vErr := r.verify(b, c.Domain, now); vErr != nil {
+			r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+				s.CertError = vErr.Error()
+				s.CertNotBefore = b.NotBefore
+				s.CertNotAfter = b.NotAfter
+				return s
+			})
+			r.certsMu.Lock()
+			prev := r.certs[c.ID]
+			delete(r.certs, c.ID)
+			r.certsMu.Unlock()
+			if prev != nil {
+				changed = true
+			}
+			continue
+		}
+		r.certsMu.Lock()
+		prev := r.certs[c.ID]
+		r.certs[c.ID] = b
+		r.certsMu.Unlock()
+		if prev == nil || prev.ContentHash != b.ContentHash {
+			r.deps.Health.Update(c.ID, func(s health.Snapshot) health.Snapshot {
+				s.CertError = ""
+				s.CertNotBefore = b.NotBefore
+				s.CertNotAfter = b.NotAfter
+				s.CertLastReload = now
+				return s
+			})
+			changed = true
+		}
+	}
+	return changed
+}
+
+// regenerate is the serialized hot path: read every current directory
+// and cert bundle, hand them to Build, hash, and POST to Caddy only on
+// change. Errors do NOT poison r.lastHash.
+func (r *Runner) regenerate(ctx context.Context) error {
+	r.regenMu.Lock()
+	defer r.regenMu.Unlock()
+
+	dirs := make(map[string]*directory.Directory, len(r.deps.Config.Communities))
+	for _, c := range r.deps.Config.Communities {
+		snap, ok := r.deps.Health.Get(c.ID)
+		if !ok || snap.CurrentDirectory == nil {
+			continue
+		}
+		dirs[c.ID] = snap.CurrentDirectory
+	}
+
+	r.certsMu.RLock()
+	certs := make(map[string]*cert.Bundle, len(r.certs))
+	for k, v := range r.certs {
+		certs[k] = v
+	}
+	r.certsMu.RUnlock()
+
+	jsonBytes, err := r.build(caddyconfig.Input{
+		Config:      r.deps.Config,
+		Directories: dirs,
+		Certs:       certs,
+	})
+	if err != nil {
+		return fmt.Errorf("build: %w", err)
+	}
+
+	hash := sha256.Sum256(jsonBytes)
+	if r.haveHash && hash == r.lastHash {
+		return nil
+	}
+
+	if err := r.apply.Apply(ctx, jsonBytes); err != nil {
+		return fmt.Errorf("apply: %w", err)
+	}
+	r.lastHash = hash
+	r.haveHash = true
+	return nil
+}
