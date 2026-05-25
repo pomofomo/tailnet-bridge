@@ -153,8 +153,17 @@ At <https://login.tailscale.com/admin/settings/keys>:
 ```sh
 git clone <this repo> && cd tailnet-bridge/caddy
 cp config.example.yml config.yml
-$EDITOR config.yml
+cp .env.example .env
+$EDITOR config.yml .env
 ```
+
+Two files drive every run:
+
+- `config.yml` — what communities you belong to and which env var holds
+  each auth key. Mounted read-only into the container.
+- `.env` — the actual auth-key values. Read by `docker compose` (and
+  therefore by `make image` / `make up`) and injected as env vars into
+  the container. Never committed; `.gitignore` already excludes it.
 
 A minimal `config.yml`:
 
@@ -197,20 +206,21 @@ The `id` for each community is purely local — it appears only in your
 state directory layout and `/__bridge_status` output. It does **not** have
 to match anything on the community side.
 
-### 4. Provide the auth keys
+### 4. Fill in the auth keys
 
-Put them in a `.env` file next to `docker-compose.yml`:
+Edit `.env`. The keys in `.env.example` are placeholders — replace each
+`tskey-auth-REPLACE-ME` with the real value:
 
 ```sh
 PERSONAL_TAILNET_AUTHKEY=tskey-auth-...
 SMITHFAMILY_AUTHKEY=tskey-auth-...
-AUSTINMAKERS_AUTHKEY=tskey-auth-...
+# AUSTINMAKERS_AUTHKEY=tskey-auth-...
 ```
 
-`docker-compose.yml` reads these by name and refuses to start if
-`PERSONAL_TAILNET_AUTHKEY` is missing. Adjust the env section of
-`docker-compose.yml` to add lines for new communities you add to
-`config.yml`.
+`docker-compose.yml` refuses to start (and `make image` refuses to build)
+if `PERSONAL_TAILNET_AUTHKEY` is missing — that hard fail is intentional.
+When you add a community to `config.yml`, add the matching line both to
+`.env` and to the `environment:` block of `docker-compose.yml`.
 
 Alternative for the security-conscious: use `auth_key_file:
 /run/secrets/foo` in `config.yml` and mount the secrets in via Docker
